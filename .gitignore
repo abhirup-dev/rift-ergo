@@ -1,3 +1,17 @@
+# Cargo build output
+/debug/
 /target/
-/.serena/
+
+# Rust tooling output
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+rustc-ice-*.txt
+*.profraw
+
+# Machine-local files
 .DS_Store
+.env
+.env.*
+!.env.example
+*.log
