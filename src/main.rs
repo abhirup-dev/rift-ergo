@@ -38,6 +38,11 @@ fn run() -> Result<()> {
             require_no_more_arguments(&mut args)?;
             workflow::move_workspace_to_display(direction)
         }
+        "rehome" => {
+            let workspace = args.next();
+            require_no_more_arguments(&mut args)?;
+            workflow::rehome(workspace.as_deref())
+        }
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -51,7 +56,8 @@ fn print_usage() {
         "usage:
   rift-ergo move-follow <workspace-name>
   rift-ergo move-window-to-display <next|prev>
-  rift-ergo move-workspace-to-display <next|prev>"
+  rift-ergo move-workspace-to-display <next|prev>
+  rift-ergo rehome [workspace-name]"
     );
 }
 
@@ -79,7 +85,8 @@ fn usage_error(message: impl Into<String>) -> DynError {
 usage:
   rift-ergo move-follow <workspace-name>
   rift-ergo move-window-to-display <next|prev>
-  rift-ergo move-workspace-to-display <next|prev>",
+  rift-ergo move-workspace-to-display <next|prev>
+  rift-ergo rehome [workspace-name]",
             message.into()
         ),
     )

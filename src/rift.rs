@@ -123,6 +123,18 @@ impl Rift {
         Ok((workspace_name, target))
     }
 
+    pub fn workspace_at(
+        &self,
+        target: &TargetContext,
+        workspace_name: &str,
+    ) -> Result<WorkspaceData> {
+        self.client
+            .get_workspaces(Some(target.space))?
+            .into_iter()
+            .find(|workspace| workspace.name == workspace_name)
+            .ok_or_else(|| state_error(format!("unknown workspace: {workspace_name}")))
+    }
+
     pub fn focused_window(&self, displays: &[DisplayData]) -> Result<FocusedWindow> {
         let focused = self.focused_workspace(displays)?;
         Ok(FocusedWindow {
