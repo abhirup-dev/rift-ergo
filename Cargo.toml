@@ -1,0 +1,11 @@
+[package]
+name = "rift-ergo"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+crossbeam-channel = "0.5.16"
+rift-client = { git = "https://github.com/acsandmann/rift.git", rev = "6c64d8b7bacda04958e673d32c7540c726c02928" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
