@@ -177,6 +177,11 @@ impl Rift {
         Err(state_error("no focused Rift-managed window"))
     }
 
+    /// Workspaces on a macOS space, in configured order.
+    pub fn workspaces(&self, space: u64) -> Result<Vec<WorkspaceData>> {
+        Ok(self.client.get_workspaces(Some(space))?)
+    }
+
     pub fn subscribe(&self) -> Result<RiftMachSubscription> {
         Ok(self.client.subscribe(EventKind::All)?)
     }

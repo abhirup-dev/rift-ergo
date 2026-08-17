@@ -22,6 +22,13 @@
 //! destroying it. There is no AppleScript equivalent; macOS exposes no scripting
 //! API for Spaces.
 //!
+//! Switching the space is not enough on its own. macOS keeps the frontmost
+//! application visible, so if focus stays on the fullscreen window -- and the
+//! destination workspace is empty, giving focus nothing to land on -- the
+//! WindowServer drags the fullscreen space straight back, flapping between the
+//! two. When the destination has nothing focusable, park focus on Finder, which
+//! owns no windows and so pulls no space of its own.
+//!
 //! Bound with `dlopen`/`dlsym` rather than linked, so a missing symbol on a
 //! future macOS degrades to "escape unavailable" instead of failing to launch.
 //!
@@ -64,18 +71,46 @@ pub fn ensure_managed_space(
     // Rift reports workspaces for fullscreen spaces too, so a managed space
     // cannot be identified up front -- show each candidate and let
     // `display_space` adjudicate. Bounded by this display's own space count.
-    for space in display.inactive_space_ids.clone() {
-        if !skylight::show_space(display_uuid, space) {
-            break;
-        }
-        // The switch is asynchronous. Without settling, Rift still reports the
-        // old space, this reads it as a failure, and the next candidate undoes
-        // the switch that just worked.
-        if let Some(displays) = await_managed_space(rift, display_uuid)? {
-            return Ok(displays);
-        }
+    // Pick the Desktop by space type rather than trying candidates in turn.
+    // Switching to another fullscreen space never recovers the display, and
+    // doing so churns macOS's fullscreen space ids. Stale ids report as
+    // non-desktop, so they are filtered out here too.
+    let Some(desktop) = display
+        .inactive_space_ids
+        .iter()
+        .copied()
+        .find(|space| skylight::is_desktop(*space))
+    else {
+        return Ok(displays);
+    };
+
+    if !skylight::show_space(display_uuid, desktop) {
+        return Ok(displays);
     }
-    Ok(displays)
+    // The switch is asynchronous; without settling, Rift still reports the old
+    // space and the caller reads a working switch as a failure.
+    let Some(refreshed) = await_managed_space(rift, display_uuid)? else {
+        return Ok(displays);
+    };
+    park_focus_if_unheld(rift, desktop)?;
+    Ok(refreshed)
+}
+
+/// Keep macOS from dragging the fullscreen space back.
+///
+/// The frontmost application stays the fullscreen one, and macOS keeps it
+/// visible. If the destination has a window, the caller's focus step lands on it
+/// and that settles the contest. If it has none, focus has nowhere to go and the
+/// display flaps, so hand it to Finder instead.
+fn park_focus_if_unheld(rift: &Rift, space: u64) -> Result<()> {
+    let focusable = rift
+        .workspaces(space)?
+        .iter()
+        .any(|workspace| workspace.is_active && !workspace.windows.is_empty());
+    if !focusable {
+        skylight::park_focus();
+    }
+    Ok(())
 }
 
 fn await_managed_space(rift: &Rift, display_uuid: &str) -> Result<Option<Vec<DisplayData>>> {
@@ -114,8 +149,18 @@ pub fn focus_display(rift: &Rift, display_uuid: &str, space: u64) -> Result<()> 
 /// Minimal binding to the private SkyLight space-switching call.
 mod skylight {
     use std::ffi::{CString, c_char, c_int, c_void};
+    use std::process::Command;
     use std::ptr;
     use std::sync::OnceLock;
+
+    /// `CGSSpaceGetType` reports 0 for an ordinary Desktop. Fullscreen spaces
+    /// report 3, as do ids that no longer exist, so this doubles as a staleness
+    /// filter.
+    const SPACE_TYPE_DESKTOP: c_int = 0;
+
+    /// Finder owns no windows of its own, so making it frontmost releases the
+    /// fullscreen application's claim without pulling in another space.
+    const FOCUS_PARK_BUNDLE_ID: &str = "com.apple.finder";
 
     const RTLD_LAZY: c_int = 1;
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
@@ -130,12 +175,14 @@ mod skylight {
 
     type MainConnectionId = unsafe extern "C" fn() -> c_int;
     type SetCurrentSpace = unsafe extern "C" fn(c_int, *const c_void, u64);
+    type SpaceGetType = unsafe extern "C" fn(c_int, u64) -> c_int;
     type StringCreate = unsafe extern "C" fn(*const c_void, *const c_char, u32) -> *const c_void;
     type Release = unsafe extern "C" fn(*const c_void);
 
     struct Api {
         connection: MainConnectionId,
         set_current_space: SetCurrentSpace,
+        space_get_type: SpaceGetType,
         string_create: StringCreate,
         release: Release,
     }
@@ -168,6 +215,26 @@ mod skylight {
         true
     }
 
+    /// Whether `space` is an ordinary Desktop rather than a fullscreen space.
+    pub fn is_desktop(space: u64) -> bool {
+        let Some(api) = api() else {
+            return false;
+        };
+        // Safety: resolved from SkyLight above; takes a connection and a space id.
+        unsafe { (api.space_get_type)((api.connection)(), space) == SPACE_TYPE_DESKTOP }
+    }
+
+    /// Make Finder frontmost. Best-effort; failure just means the display may
+    /// flap back, which is the behaviour without this module at all.
+    pub fn park_focus() {
+        let _ = Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(format!(
+                "tell application id \"{FOCUS_PARK_BUNDLE_ID}\" to activate"
+            ))
+            .output();
+    }
+
     fn api() -> Option<&'static Api> {
         static API: OnceLock<Option<Api>> = OnceLock::new();
         API.get_or_init(load).as_ref()
@@ -187,6 +254,10 @@ mod skylight {
                 set_current_space: std::mem::transmute::<*mut c_void, SetCurrentSpace>(symbol(
                     skylight,
                     "CGSManagedDisplaySetCurrentSpace",
+                )?),
+                space_get_type: std::mem::transmute::<*mut c_void, SpaceGetType>(symbol(
+                    skylight,
+                    "CGSSpaceGetType",
                 )?),
                 string_create: std::mem::transmute::<*mut c_void, StringCreate>(symbol(
                     core_foundation,
