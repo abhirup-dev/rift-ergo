@@ -7,6 +7,7 @@ use crate::{Result, state_error};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CrossDisplayState {
     PrepareDestination,
+    SeedDestination,
     TransferWindow,
     FollowTransferredWindow,
     FocusTransferredWindow,
@@ -87,13 +88,21 @@ impl CrossDisplayWorkflow<'_> {
         loop {
             state = match state {
                 CrossDisplayState::PrepareDestination => {
-                    prepare_target(
-                        self.rift,
-                        self.transaction,
-                        &self.target,
-                        self.workspace_name,
-                    )?;
-                    CrossDisplayState::TransferWindow
+                    if self.destination_has_no_focus_anchor() {
+                        CrossDisplayState::SeedDestination
+                    } else {
+                        prepare_target(
+                            self.rift,
+                            self.transaction,
+                            &self.target,
+                            self.workspace_name,
+                        )?;
+                        CrossDisplayState::TransferWindow
+                    }
+                }
+                CrossDisplayState::SeedDestination => {
+                    self.seed_destination()?;
+                    CrossDisplayState::FollowTransferredWindow
                 }
                 CrossDisplayState::TransferWindow => {
                     self.transfer_window()?;
@@ -114,6 +123,35 @@ impl CrossDisplayWorkflow<'_> {
                 CrossDisplayState::Complete => return Ok(()),
             };
         }
+    }
+
+    /// Rift can only focus a display by focusing a window on it. When the
+    /// destination's active workspace is empty there is nothing to focus, and
+    /// the MoveMouseToDisplay fallback is inert unless focus_follows_mouse is
+    /// enabled, so `prepare_target` would time out.
+    fn destination_has_no_focus_anchor(&self) -> bool {
+        !self.target.display_is_active && self.target.focus_anchor.is_none()
+    }
+
+    /// Break that deadlock by transferring the window before acquiring focus:
+    /// MoveWindowToDisplay takes an explicit display selector and does not
+    /// require the destination to be active. The transferred window then serves
+    /// as the anchor, and the ordinary follow/focus steps finish the move —
+    /// including the workspace activation `prepare_target` was skipped for.
+    fn seed_destination(&self) -> Result<()> {
+        self.transaction.step(
+            "window transfer to unfocusable display",
+            self.rift
+                .transfer_window_command(&self.target, &self.window),
+            EventExpectation::Display(&self.target.display_uuid),
+            |rift| rift.window_is_on_display(&self.target, self.window.id),
+        )?;
+        self.transaction.step(
+            "target display focus via transferred window",
+            self.rift.focus_window_command(&self.window),
+            EventExpectation::Display(&self.target.display_uuid),
+            |rift| rift.display_is_active(&self.target.display_uuid),
+        )
     }
 
     fn transfer_window(&self) -> Result<()> {
