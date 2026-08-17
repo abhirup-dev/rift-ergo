@@ -150,8 +150,11 @@ fn await_managed_space(rift: &Rift, display_uuid: &str) -> Result<Option<Vec<Dis
 /// `prepare_target` focuses a destination by focusing a window in that display's
 /// active workspace. When that workspace is empty there is no anchor, and the
 /// `MoveMouseToDisplay` fallback is inert unless `focus_follows_mouse` is
-/// enabled. Re-showing the space the display is already on activates it without
-/// needing a window.
+/// enabled, so `prepare_target` waits for a focus that never arrives.
+///
+/// Show the space and then activate an application, for the same reason
+/// `ensure_managed_space` does: the space call alone moves no focus and forces
+/// no redraw.
 ///
 /// Best-effort, for the same reason as above.
 pub fn focus_display(rift: &Rift, display_uuid: &str, space: u64) -> Result<()> {
@@ -159,7 +162,7 @@ pub fn focus_display(rift: &Rift, display_uuid: &str, space: u64) -> Result<()> 
         return Ok(());
     }
     skylight::show_space(display_uuid, space);
-    Ok(())
+    settle_focus(rift, space)
 }
 
 /// Minimal binding to the private SkyLight space-switching call.
