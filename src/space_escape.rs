@@ -22,14 +22,20 @@
 //! destroying it. There is no AppleScript equivalent; macOS exposes no scripting
 //! API for Spaces.
 //!
-//! Switching the space is not enough on its own. It updates the WindowServer's
-//! bookkeeping but neither redraws the display away from the fullscreen space
-//! nor gives up the fullscreen application's claim to being frontmost, so macOS
-//! pulls its space back. Both read as "the keybinding did nothing": the space
-//! queries as switched while the screen still shows the fullscreen window,
-//! sometimes with the destination's windows composited over it. Activating an
-//! application does force the transition, so the switch is always followed by
-//! one.
+//! Prefer not to use it, though. `CGSManagedDisplaySetCurrentSpace` performs a
+//! raw current-space swap with no leave-fullscreen teardown, so the old window's
+//! layers stay composited -- the destination's windows draw inside a frame the
+//! fullscreen window still owns. Activating afterwards does not repair it: by
+//! then the display already reads as switched, so macOS sees no Space change to
+//! perform.
+//!
+//! Focusing a window that lives on the destination avoids all of that. macOS
+//! decides for itself that a Space change is required and runs its real,
+//! animated, fully composited transition. That is the whole of AeroSpace's
+//! approach -- it drives no Spaces at all, and its entire private surface is
+//! `_AXUIElementGetWindow` -- which is why it needs no SIP changes and does not
+//! suffer this. So: activate first, and fall back to the direct space call only
+//! when the destination has no window to focus.
 //!
 //! Bound with `dlopen`/`dlsym` rather than linked, so a missing symbol on a
 //! future macOS degrades to "escape unavailable" instead of failing to launch.
@@ -87,46 +93,47 @@ pub fn ensure_managed_space(
         return Ok(displays);
     };
 
+    // Prefer letting macOS run the transition itself. Focusing a window that
+    // lives on the destination makes the WindowServer decide a Space change is
+    // needed, and it then performs the real, fully composited leave-fullscreen
+    // animation. This is all AeroSpace does, and why it needs no CGS calls.
+    if let Some(occupant) = occupant_bundle_id(rift, desktop)? {
+        skylight::activate(&occupant);
+        // The transition is asynchronous; without settling, Rift still reports
+        // the old space and the caller reads a working switch as a failure.
+        if let Some(refreshed) = await_managed_space(rift, display_uuid)? {
+            return Ok(refreshed);
+        }
+    }
+
+    // Nothing on the destination to focus, so there is no window whose raise
+    // would imply a Space change. Switch it directly instead. This flips the
+    // current space without the leave-fullscreen teardown, so the old window's
+    // layers can stay composited until something forces a redraw -- acceptable
+    // only because the alternative is not switching at all.
     if !skylight::show_space(display_uuid, desktop) {
         return Ok(displays);
     }
-    // The switch is asynchronous; without settling, Rift still reports the old
-    // space and the caller reads a working switch as a failure.
     let Some(refreshed) = await_managed_space(rift, display_uuid)? else {
         return Ok(displays);
     };
-    settle_focus(rift, desktop)?;
+    skylight::activate(FOCUS_PARK_BUNDLE_ID);
     Ok(refreshed)
 }
 
-/// Complete the switch by moving the frontmost application.
-///
-/// Setting the current space only updates the WindowServer's bookkeeping: it
-/// does not redraw a display away from a fullscreen space, and it leaves the
-/// fullscreen application frontmost so macOS pulls its space back. Both show up
-/// as "the keybinding did nothing" -- the space reads as switched while the
-/// screen still shows the fullscreen window, sometimes with the destination's
-/// windows composited over it.
-///
-/// Activating an application does force the transition. Prefer one with a window
-/// on the destination, so focus also lands where the caller wants it. Rift's own
-/// focus commands are no use here; they cannot cross out of a space Rift is not
-/// tracking.
-fn settle_focus(rift: &Rift, space: u64) -> Result<()> {
-    let occupant = rift
-        .workspaces(space)?
-        .into_iter()
+/// An application with a window on `space`, preferring the active workspace so
+/// focus lands where the caller wants it. Rift's own focus commands are no use
+/// here; they cannot cross out of a space Rift is not tracking.
+fn occupant_bundle_id(rift: &Rift, space: u64) -> Result<Option<String>> {
+    let workspaces = rift.workspaces(space)?;
+    let preferred = workspaces
+        .iter()
         .find(|workspace| workspace.is_active)
-        .and_then(|workspace| {
-            workspace
-                .windows
-                .first()
-                .and_then(|window| window.bundle_id.clone())
-        });
-    // Finder owns no windows, so it releases the fullscreen application without
-    // dragging in a space of its own.
-    skylight::activate(occupant.as_deref().unwrap_or(FOCUS_PARK_BUNDLE_ID));
-    Ok(())
+        .into_iter()
+        .chain(workspaces.iter());
+    Ok(preferred
+        .flat_map(|workspace| workspace.windows.iter())
+        .find_map(|window| window.bundle_id.clone()))
 }
 
 fn await_managed_space(rift: &Rift, display_uuid: &str) -> Result<Option<Vec<DisplayData>>> {
@@ -152,17 +159,23 @@ fn await_managed_space(rift: &Rift, display_uuid: &str) -> Result<Option<Vec<Dis
 /// `MoveMouseToDisplay` fallback is inert unless `focus_follows_mouse` is
 /// enabled, so `prepare_target` waits for a focus that never arrives.
 ///
-/// Show the space and then activate an application, for the same reason
-/// `ensure_managed_space` does: the space call alone moves no focus and forces
-/// no redraw.
+/// Activating an application on the display is enough to make it active, and is
+/// preferred for the same reason as in `ensure_managed_space`. Fall back to the
+/// direct space call only when the display has nothing to focus.
 ///
 /// Best-effort, for the same reason as above.
 pub fn focus_display(rift: &Rift, display_uuid: &str, space: u64) -> Result<()> {
     if rift.display_is_active(display_uuid)? {
         return Ok(());
     }
-    skylight::show_space(display_uuid, space);
-    settle_focus(rift, space)
+    match occupant_bundle_id(rift, space)? {
+        Some(occupant) => skylight::activate(&occupant),
+        None => {
+            skylight::show_space(display_uuid, space);
+            skylight::activate(FOCUS_PARK_BUNDLE_ID);
+        }
+    }
+    Ok(())
 }
 
 /// Minimal binding to the private SkyLight space-switching call.
