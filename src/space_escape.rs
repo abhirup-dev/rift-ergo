@@ -22,12 +22,14 @@
 //! destroying it. There is no AppleScript equivalent; macOS exposes no scripting
 //! API for Spaces.
 //!
-//! Switching the space is not enough on its own. macOS keeps the frontmost
-//! application visible, so if focus stays on the fullscreen window -- and the
-//! destination workspace is empty, giving focus nothing to land on -- the
-//! WindowServer drags the fullscreen space straight back, flapping between the
-//! two. When the destination has nothing focusable, park focus on Finder, which
-//! owns no windows and so pulls no space of its own.
+//! Switching the space is not enough on its own. It updates the WindowServer's
+//! bookkeeping but neither redraws the display away from the fullscreen space
+//! nor gives up the fullscreen application's claim to being frontmost, so macOS
+//! pulls its space back. Both read as "the keybinding did nothing": the space
+//! queries as switched while the screen still shows the fullscreen window,
+//! sometimes with the destination's windows composited over it. Activating an
+//! application does force the transition, so the switch is always followed by
+//! one.
 //!
 //! Bound with `dlopen`/`dlsym` rather than linked, so a missing symbol on a
 //! future macOS degrades to "escape unavailable" instead of failing to launch.
@@ -43,6 +45,10 @@ use rift_client::DisplayData;
 
 use crate::Result;
 use crate::rift::{Rift, display_space};
+
+/// Finder owns no windows, so making it frontmost releases the fullscreen
+/// application without pulling in a space of its own.
+const FOCUS_PARK_BUNDLE_ID: &str = "com.apple.finder";
 
 const SETTLE_TIMEOUT: Duration = Duration::from_millis(1_500);
 const PROBE_INTERVAL: Duration = Duration::from_millis(50);
@@ -68,9 +74,6 @@ pub fn ensure_managed_space(
         return Ok(displays);
     }
 
-    // Rift reports workspaces for fullscreen spaces too, so a managed space
-    // cannot be identified up front -- show each candidate and let
-    // `display_space` adjudicate. Bounded by this display's own space count.
     // Pick the Desktop by space type rather than trying candidates in turn.
     // Switching to another fullscreen space never recovers the display, and
     // doing so churns macOS's fullscreen space ids. Stale ids report as
@@ -92,24 +95,37 @@ pub fn ensure_managed_space(
     let Some(refreshed) = await_managed_space(rift, display_uuid)? else {
         return Ok(displays);
     };
-    park_focus_if_unheld(rift, desktop)?;
+    settle_focus(rift, desktop)?;
     Ok(refreshed)
 }
 
-/// Keep macOS from dragging the fullscreen space back.
+/// Complete the switch by moving the frontmost application.
 ///
-/// The frontmost application stays the fullscreen one, and macOS keeps it
-/// visible. If the destination has a window, the caller's focus step lands on it
-/// and that settles the contest. If it has none, focus has nowhere to go and the
-/// display flaps, so hand it to Finder instead.
-fn park_focus_if_unheld(rift: &Rift, space: u64) -> Result<()> {
-    let focusable = rift
+/// Setting the current space only updates the WindowServer's bookkeeping: it
+/// does not redraw a display away from a fullscreen space, and it leaves the
+/// fullscreen application frontmost so macOS pulls its space back. Both show up
+/// as "the keybinding did nothing" -- the space reads as switched while the
+/// screen still shows the fullscreen window, sometimes with the destination's
+/// windows composited over it.
+///
+/// Activating an application does force the transition. Prefer one with a window
+/// on the destination, so focus also lands where the caller wants it. Rift's own
+/// focus commands are no use here; they cannot cross out of a space Rift is not
+/// tracking.
+fn settle_focus(rift: &Rift, space: u64) -> Result<()> {
+    let occupant = rift
         .workspaces(space)?
-        .iter()
-        .any(|workspace| workspace.is_active && !workspace.windows.is_empty());
-    if !focusable {
-        skylight::park_focus();
-    }
+        .into_iter()
+        .find(|workspace| workspace.is_active)
+        .and_then(|workspace| {
+            workspace
+                .windows
+                .first()
+                .and_then(|window| window.bundle_id.clone())
+        });
+    // Finder owns no windows, so it releases the fullscreen application without
+    // dragging in a space of its own.
+    skylight::activate(occupant.as_deref().unwrap_or(FOCUS_PARK_BUNDLE_ID));
     Ok(())
 }
 
@@ -157,10 +173,6 @@ mod skylight {
     /// report 3, as do ids that no longer exist, so this doubles as a staleness
     /// filter.
     const SPACE_TYPE_DESKTOP: c_int = 0;
-
-    /// Finder owns no windows of its own, so making it frontmost releases the
-    /// fullscreen application's claim without pulling in another space.
-    const FOCUS_PARK_BUNDLE_ID: &str = "com.apple.finder";
 
     const RTLD_LAZY: c_int = 1;
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
@@ -224,14 +236,14 @@ mod skylight {
         unsafe { (api.space_get_type)((api.connection)(), space) == SPACE_TYPE_DESKTOP }
     }
 
-    /// Make Finder frontmost. Best-effort; failure just means the display may
-    /// flap back, which is the behaviour without this module at all.
-    pub fn park_focus() {
+    /// Make an application frontmost, by bundle id so no dependency on process
+    /// names (Teams is "MSTeams", Sublime Text is "sublime_text"). Best-effort;
+    /// failure just means the display may not complete its transition, which is
+    /// the behaviour without this module at all.
+    pub fn activate(bundle_id: &str) {
         let _ = Command::new("/usr/bin/osascript")
             .arg("-e")
-            .arg(format!(
-                "tell application id \"{FOCUS_PARK_BUNDLE_ID}\" to activate"
-            ))
+            .arg(format!("tell application id \"{bundle_id}\" to activate"))
             .output();
     }
 
