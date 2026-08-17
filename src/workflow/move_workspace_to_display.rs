@@ -3,6 +3,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::rift::{Rift, TargetContext};
+use crate::space_escape;
 use crate::transaction::{EventExpectation, RiftTransaction};
 use crate::{Result, state_error};
 
@@ -33,8 +34,24 @@ pub fn move_workspace_to_display(direction: DisplayDirection) -> Result<()> {
         return Ok(());
     };
     let workspace_name = source.workspace.name.clone();
+
+    // A display showing a native-fullscreen space has no space Rift manages, so
+    // `target_context` below -- and every display-targeted command after it --
+    // would fail outright. Recover it first. `source` is captured above because
+    // escaping works by activating an application, which moves focus.
+    let displays = space_escape::ensure_managed_space(&rift, &target_display.uuid, displays)?;
+
     let mut target =
         rift.target_context(&workspace_name, target_display.uuid.clone(), &displays)?;
+
+    // The deadlock `placement`'s SeedDestination handles, reached by the other
+    // route: `prepare_target` focuses the destination by focusing a window
+    // there, and an inactive display whose active workspace is empty offers
+    // none. Seeding is not available here because `prepare_target` runs before
+    // any window moves, so acquire the display up front instead.
+    if !target.display_is_active && target.focus_anchor.is_none() {
+        space_escape::focus_display(&rift, &target.display_uuid, target.space)?;
+    }
 
     if source.workspace.windows.len() == 1 {
         let transaction = RiftTransaction::new(&rift)?;
