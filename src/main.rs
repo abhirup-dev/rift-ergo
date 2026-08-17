@@ -29,6 +29,13 @@ fn run() -> Result<()> {
             require_no_more_arguments(&mut args)?;
             workflow::move_follow(&workspace)
         }
+        "switch-workspace" => {
+            let workspace = args
+                .next()
+                .ok_or_else(|| usage_error("missing workspace"))?;
+            require_no_more_arguments(&mut args)?;
+            workflow::switch_workspace(&workspace)
+        }
         "move-window-to-display" => {
             let direction = parse_display_direction(&mut args)?;
             require_no_more_arguments(&mut args)?;
@@ -56,6 +63,7 @@ fn print_usage() {
     println!(
         "usage:
   rift-ergo move-follow <workspace-name>
+  rift-ergo switch-workspace <workspace-name>
   rift-ergo move-window-to-display <next|prev>
   rift-ergo move-workspace-to-display <next|prev>
   rift-ergo rehome [workspace-name]"
@@ -85,6 +93,7 @@ fn usage_error(message: impl Into<String>) -> DynError {
             "{}
 usage:
   rift-ergo move-follow <workspace-name>
+  rift-ergo switch-workspace <workspace-name>
   rift-ergo move-window-to-display <next|prev>
   rift-ergo move-workspace-to-display <next|prev>
   rift-ergo rehome [workspace-name]",

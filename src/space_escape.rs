@@ -66,6 +66,34 @@ pub fn ensure_managed_space(
     Ok(displays)
 }
 
+/// Focus a display that Rift cannot focus on its own.
+///
+/// `prepare_target` focuses a destination by focusing a window in that
+/// display's active workspace. When that workspace is empty there is no anchor,
+/// and the `MoveMouseToDisplay` fallback is inert unless `focus_follows_mouse`
+/// is enabled. Fall back to the same activation trick used above: any window on
+/// the display will do, since callers are about to switch workspaces anyway.
+///
+/// Best-effort. If nothing anchors, the caller fails exactly as it did before.
+pub fn focus_display(rift: &Rift, display_uuid: &str, space: u64) -> Result<()> {
+    if rift.display_is_active(display_uuid)? {
+        return Ok(());
+    }
+    let Some(anchor) = anchor_bundle_id(rift, space)? else {
+        return Ok(());
+    };
+    activate_application(&anchor)?;
+
+    let deadline = Instant::now() + ESCAPE_TIMEOUT;
+    while Instant::now() < deadline {
+        thread::sleep(PROBE_INTERVAL);
+        if rift.display_is_active(display_uuid)? {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// First window of the lowest-numbered occupied workspace on `space`. Rift
 /// returns workspaces in configured order, so this prefers workspace 1, then 2,
 /// and so on, rather than depending on any particular app being open.
