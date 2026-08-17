@@ -50,11 +50,8 @@ pub fn move_workspace_to_display(direction: DisplayDirection) -> Result<()> {
             Err(error) if !is_timeout(&error) => return Err(error),
             Err(_) => {
                 let refreshed_displays = rift.displays()?;
-                target = rift.target_context(
-                    &workspace_name,
-                    target_display.uuid.clone(),
-                    &refreshed_displays,
-                )?;
+                target =
+                    rift.target_context(&workspace_name, target_display.uuid, &refreshed_displays)?;
             }
         }
     }
