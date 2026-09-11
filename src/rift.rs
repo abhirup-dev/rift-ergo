@@ -313,21 +313,18 @@ impl Rift {
         if self.window_location(target, window_id)?.is_none() {
             return Ok(false);
         }
-        // Prefer the layout engine's own placement. It is authoritative and is
-        // decided before any window animation, so it does not produce the
-        // false negatives that reading a mid-animation AX frame does, and it
-        // stays correct in scrolling layouts where geometry cannot distinguish
-        // displays at all.
-        if self.layout_tiles_window(target, window_id)? {
+        let window = self.client.get_window_info(window_id)?;
+        if frame_matches_display(&window.frame, target.frame_validation) {
             return Ok(true);
         }
-        // Floating and untracked windows have no layout target; geometry
-        // remains the only available signal for them.
-        let window = self.client.get_window_info(window_id)?;
-        Ok(frame_matches_display(
-            &window.frame,
-            target.frame_validation,
-        ))
+        // Only once geometry has said no. This runs inside the confirmation
+        // poll loop, so querying the layout engine first would add a Mach
+        // round-trip per window per iteration, contending with the reactor
+        // precisely while it is applying layout. On the negative path the
+        // caller would otherwise loop anyway, so the query is free in
+        // practice, and the engine decides a window's target frame before any
+        // animation -- which is exactly where a mid-animation AX frame lies.
+        self.layout_tiles_window(target, window_id)
     }
 
     /// Whether Rift's layout engine tiles `window_id` in the target workspace.

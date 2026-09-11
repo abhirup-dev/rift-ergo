@@ -14,6 +14,7 @@ const SINGLETON_TRANSFER_ATTEMPTS: usize = 2;
 const SINGLETON_FAST_TRANSFER_TIMEOUT: Duration = Duration::from_millis(250);
 const SINGLETON_FOCUS_TIMEOUT: Duration = Duration::from_millis(500);
 const WINDOW_TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
+const ORDER_SWAP_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MoveWorkspaceState {
@@ -468,18 +469,43 @@ impl MoveWorkspaceWorkflow<'_> {
         }
 
         let swaps = order_swaps(&desired, &mut actual);
-        for (first, second) in &swaps {
-            self.rift
-                .execute(self.rift.swap_windows_command(*first, *second))?;
+        if swaps.is_empty() {
+            return Ok(());
         }
 
-        if !swaps.is_empty() {
-            crate::logging::info(&format!(
-                "restored visual order for {} windows in {} swaps",
-                desired.len(),
-                swaps.len()
-            ));
+        // Each swap is confirmed before the next is issued. Firing them back to
+        // back would queue several layout passes against a reactor that has not
+        // applied the previous one, which is what makes a reorder visible as a
+        // flicker rather than a single transition.
+        for swap in &swaps {
+            let expected = &swap.expected;
+            self.transaction.confirmed_step_with_timeout(
+                &format!(
+                    "visual order swap {} <-> {}",
+                    swap.first.idx, swap.second.idx
+                ),
+                self.rift.swap_windows_command(swap.first, swap.second),
+                EventExpectation::Workspace {
+                    display_uuid: &self.target.display_uuid,
+                    workspace_name: self.workspace_name,
+                },
+                |rift| {
+                    let current: Vec<WindowId> = rift
+                        .tiled_order(Some(self.target.space), Some(self.target.workspace_index))?
+                        .into_iter()
+                        .filter(|id| moved.contains(id))
+                        .collect();
+                    Ok(current == *expected)
+                },
+                ORDER_SWAP_TIMEOUT,
+            )?;
         }
+
+        crate::logging::info(&format!(
+            "restored visual order for {} windows in {} swaps",
+            desired.len(),
+            swaps.len()
+        ));
         Ok(())
     }
 
@@ -487,15 +513,46 @@ impl MoveWorkspaceWorkflow<'_> {
         self.windows.iter().map(|window| window.id).collect()
     }
 
-    fn ordered_windows(&self) -> impl Iterator<Item = &WindowData> {
-        self.windows
-            .iter()
-            .filter(|window| window.id != self.focused_window.id)
-            .chain(std::iter::once(self.focused_window))
+    /// Transfer order.
+    ///
+    /// Rift appends each transferred window to the destination tree, so the
+    /// arrival order becomes the visual order. Transferring in the source's
+    /// own tiled order therefore reproduces the arrangement by construction,
+    /// leaving `restore_visual_order` with nothing to do in the common case.
+    /// Focus is not a consideration here: `focus_original_window` restores it
+    /// explicitly after the transfers.
+    ///
+    /// Without a captured order, fall back to the previous behaviour of moving
+    /// the focused window last.
+    fn ordered_windows(&self) -> Vec<&WindowData> {
+        if self.source_order.is_empty() {
+            return self
+                .windows
+                .iter()
+                .filter(|window| window.id != self.focused_window.id)
+                .chain(std::iter::once(self.focused_window))
+                .collect();
+        }
+
+        let mut ordered: Vec<&WindowData> = Vec::with_capacity(self.windows.len());
+        for id in self.source_order {
+            if let Some(window) = self.windows.iter().find(|window| window.id == *id) {
+                ordered.push(window);
+            }
+        }
+        // Floating windows are absent from the tiled tree; keep them last in
+        // their existing relative order so none is dropped from the transfer.
+        for window in self.windows {
+            if !ordered.iter().any(|existing| existing.id == window.id) {
+                ordered.push(window);
+            }
+        }
+        ordered
     }
 
     fn pending_windows(&self, window_ids: &[WindowId]) -> Vec<&WindowData> {
         self.ordered_windows()
+            .into_iter()
             .filter(|window| window_ids.contains(&window.id))
             .collect()
     }
@@ -518,12 +575,21 @@ fn restore_order_disabled() -> bool {
     })
 }
 
+/// One confirmable reordering step: the pair to swap, and the full order the
+/// workspace must show once Rift has applied it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OrderSwap {
+    first: WindowId,
+    second: WindowId,
+    expected: Vec<WindowId>,
+}
+
 /// Swaps that transform `actual` into `desired`, as selection sort.
 ///
 /// Both slices must hold the same set of ids. `actual` is advanced in step so
 /// each emitted pair reflects the tree state Rift will see when that swap is
 /// applied, which keeps the command sequence valid without re-querying.
-fn order_swaps(desired: &[WindowId], actual: &mut [WindowId]) -> Vec<(WindowId, WindowId)> {
+fn order_swaps(desired: &[WindowId], actual: &mut [WindowId]) -> Vec<OrderSwap> {
     let mut swaps = Vec::new();
     for index in 0..desired.len() {
         if actual[index] == desired[index] {
@@ -532,8 +598,13 @@ fn order_swaps(desired: &[WindowId], actual: &mut [WindowId]) -> Vec<(WindowId, 
         let Some(found) = (index + 1..actual.len()).find(|&at| actual[at] == desired[index]) else {
             continue;
         };
-        swaps.push((actual[index], actual[found]));
+        let (first, second) = (actual[index], actual[found]);
         actual.swap(index, found);
+        swaps.push(OrderSwap {
+            first,
+            second,
+            expected: actual.to_vec(),
+        });
     }
     swaps
 }
@@ -564,6 +635,27 @@ mod tests {
     }
 
     #[test]
+    fn every_swap_carries_the_order_it_must_produce() {
+        let desired = ids(&[1, 2, 3, 4]);
+        let mut actual = ids(&[4, 3, 2, 1]);
+        let swaps = order_swaps(&desired, &mut actual);
+        assert_eq!(swaps.last().expect("at least one swap").expected, desired);
+        let mut replay = ids(&[4, 3, 2, 1]);
+        for swap in &swaps {
+            let first = replay
+                .iter()
+                .position(|id| *id == swap.first)
+                .expect("first present");
+            let second = replay
+                .iter()
+                .position(|id| *id == swap.second)
+                .expect("second present");
+            replay.swap(first, second);
+            assert_eq!(replay, swap.expected);
+        }
+    }
+
+    #[test]
     fn swaps_transform_actual_into_desired() {
         let desired = ids(&[1, 2, 3, 4]);
         let mut actual = ids(&[3, 4, 1, 2]);
@@ -585,7 +677,10 @@ mod tests {
         let desired = ids(&[1, 2, 3]);
         let mut actual = ids(&[2, 1, 3]);
         let swaps = order_swaps(&desired, &mut actual);
-        assert_eq!(swaps, vec![(window(2), window(1))]);
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].first, window(2));
+        assert_eq!(swaps[0].second, window(1));
+        assert_eq!(swaps[0].expected, desired);
         assert_eq!(actual, desired);
     }
 }
