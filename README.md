@@ -1,7 +1,7 @@
 # rift-ergo
 
 Fast ergonomic workflows for the local Rift setup. `rift-ergo` is pinned to
-the installed Rift v0.5.5 revision and talks directly to Rift's Mach service
+the installed Rift v0.5.8.1 revision and talks directly to Rift's Mach service
 through the typed `rift-client` API. It does not shell out to `rift-cli`.
 
 The helper is intentionally an orchestration layer, not a second window
@@ -124,13 +124,27 @@ Physical placement checks are display-topology and layout aware. Workspace
 membership is the conservative fallback when scrolling geometry cannot safely
 distinguish a display.
 
-## Deferred: visual layout order
+## Visual layout order
 
-`move-workspace-to-display` preserves membership and focus but does not
-reconstruct the source layout's exact visual order. If this becomes important,
-it can be added after transfer as a layout-specific correctness layer using
-Rift's typed `SwapWindows` primitive. That would add up to `n - 1` IPC commands,
-so it remains deferred until the visual-order benefit justifies the extra work.
+`move-workspace-to-display` restores the source workspace's tiled order on the
+destination. The order is captured from the container tree before the transfer
+and replayed afterwards as a permutation, using Rift's typed `SwapWindows`
+primitive in at most `n - 1` commands. Only the moved windows participate, so
+windows already living in the destination workspace are left untouched.
+
+This became practical in Rift 0.5.8.1, which gives container tree nodes stable
+`node_id`s and target frames. Set `RIFT_ERGO_RESTORE_ORDER=0` to disable it.
+Restoration never fails the move: membership and focus are confirmed first, and
+a reordering failure is logged rather than propagated.
+
+## Logging
+
+Keybindings run `rift-ergo` through Rift's `exec`, so stderr is discarded and a
+failing binding is otherwise silent. Every invocation appends to
+`~/Library/Logs/rift/rift-ergo.log`, next to the reconciler's log. Failures are
+tagged `source=rift` or `source=rift-ergo` so a Rift regression is not mistaken
+for one here. `rift-ergo --log-path` prints the path; `RIFT_ERGO_LOG=off`
+disables it.
 
 ## Development and installation
 

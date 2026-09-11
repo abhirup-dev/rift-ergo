@@ -1,6 +1,7 @@
 use rift_client::{
-    DisplayData, DisplaySelector, EventKind, LayoutCommand, ReactorCommand, Rect, RiftCommand,
-    RiftMachClient, RiftMachSubscription, WindowData, WindowId, WorkspaceData, WorkspaceSelector,
+    ContainerTreeNode, DisplayData, DisplaySelector, EventKind, LayoutCommand, ReactorCommand,
+    Rect, RiftCommand, RiftMachClient, RiftMachSubscription, WindowData, WindowId, WorkspaceData,
+    WorkspaceSelector,
 };
 
 use crate::{Result, state_error};
@@ -249,6 +250,29 @@ impl Rift {
         })
     }
 
+    pub fn swap_windows_command(&self, first: WindowId, second: WindowId) -> RiftCommand {
+        RiftCommand::Layout(LayoutCommand::SwapWindows(first, second))
+    }
+
+    /// Tiled windows of a workspace in Rift's visual order.
+    ///
+    /// The container tree is a normalized topology, so a depth-first
+    /// left-to-right walk yields the same order the layout engine draws for
+    /// every mode it supports. Node identity became stable in Rift 0.5.8.1,
+    /// which is what makes this order usable as a replay target.
+    pub fn tiled_order(
+        &self,
+        space: Option<u64>,
+        workspace_index: Option<usize>,
+    ) -> Result<Vec<WindowId>> {
+        let layout = self
+            .client
+            .get_workspace_layout_state(space, workspace_index)?;
+        let mut order = Vec::new();
+        collect_tiled_leaves(&layout.container_tree, &mut order);
+        Ok(order)
+    }
+
     pub fn display_is_active(&self, display_uuid: &str) -> Result<bool> {
         Ok(self
             .client
@@ -289,11 +313,33 @@ impl Rift {
         if self.window_location(target, window_id)?.is_none() {
             return Ok(false);
         }
+        // Prefer the layout engine's own placement. It is authoritative and is
+        // decided before any window animation, so it does not produce the
+        // false negatives that reading a mid-animation AX frame does, and it
+        // stays correct in scrolling layouts where geometry cannot distinguish
+        // displays at all.
+        if self.layout_tiles_window(target, window_id)? {
+            return Ok(true);
+        }
+        // Floating and untracked windows have no layout target; geometry
+        // remains the only available signal for them.
         let window = self.client.get_window_info(window_id)?;
         Ok(frame_matches_display(
             &window.frame,
             target.frame_validation,
         ))
+    }
+
+    /// Whether Rift's layout engine tiles `window_id` in the target workspace.
+    ///
+    /// A `false` result is not evidence of absence: the window may be floating,
+    /// or the engine may not track it in this workspace, so callers fall back
+    /// to their own check rather than treating this as authoritative denial.
+    fn layout_tiles_window(&self, target: &TargetContext, window_id: WindowId) -> Result<bool> {
+        let layout = self
+            .client
+            .get_workspace_layout_state(Some(target.space), Some(target.workspace_index))?;
+        Ok(layout.tiled_windows.contains(&window_id))
     }
 
     pub fn window_is_focused_at(
@@ -433,6 +479,15 @@ fn frame_validation(
         FrameValidation::Horizontal(target.frame)
     } else {
         FrameValidation::MembershipOnly
+    }
+}
+
+fn collect_tiled_leaves(node: &ContainerTreeNode, order: &mut Vec<WindowId>) {
+    if let Some(window_id) = node.window_id {
+        order.push(window_id);
+    }
+    for child in &node.children {
+        collect_tiled_leaves(child, order);
     }
 }
 

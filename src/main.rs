@@ -1,3 +1,4 @@
+mod logging;
 mod policy;
 mod rift;
 mod space_escape;
@@ -7,14 +8,44 @@ mod workflow;
 use std::env;
 use std::error::Error;
 use std::io;
+use std::time::Instant;
 
 type DynError = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, DynError>;
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("rift-ergo: {error}");
-        std::process::exit(1);
+    let invocation: Vec<String> = env::args().skip(1).collect();
+    let started = Instant::now();
+    logging::info(&format!("invoke [{}]", invocation.join(" ")));
+
+    match run() {
+        Ok(()) => {
+            logging::info(&format!(
+                "ok [{}] in {} ms",
+                invocation.join(" "),
+                started.elapsed().as_millis()
+            ));
+        }
+        Err(error) => {
+            // Rift's Mach transport surfaces its own failures verbatim; attribute
+            // those to Rift so an upgrade regression is not mistaken for ours.
+            let text = error.to_string();
+            let source = if text.contains("Mach service") || text.contains("Communication error") {
+                "rift"
+            } else {
+                "rift-ergo"
+            };
+            logging::error(
+                source,
+                &format!(
+                    "failed [{}] after {} ms: {text}",
+                    invocation.join(" "),
+                    started.elapsed().as_millis()
+                ),
+            );
+            eprintln!("rift-ergo: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -43,6 +74,13 @@ fn run() -> Result<()> {
             require_no_more_arguments(&mut args)?;
             workflow::switch_workspace_both(&workspace)
         }
+        "switch-workspace-focused" => {
+            let workspace = args
+                .next()
+                .ok_or_else(|| usage_error("missing workspace"))?;
+            require_no_more_arguments(&mut args)?;
+            workflow::switch_workspace_focused(&workspace)
+        }
         "move-window-to-display" => {
             let direction = parse_display_direction(&mut args)?;
             require_no_more_arguments(&mut args)?;
@@ -62,6 +100,11 @@ fn run() -> Result<()> {
             print_usage();
             Ok(())
         }
+        "--log-path" => {
+            require_no_more_arguments(&mut args)?;
+            println!("{}", logging::describe());
+            Ok(())
+        }
         _ => Err(usage_error(format!("unknown command: {command}"))),
     }
 }
@@ -72,9 +115,10 @@ fn print_usage() {
   rift-ergo move-follow <workspace-name>
   rift-ergo switch-workspace <workspace-name>
   rift-ergo switch-workspace-both <workspace-name>
+  rift-ergo switch-workspace-focused <workspace-name>
   rift-ergo move-window-to-display <next|prev>
   rift-ergo move-workspace-to-display <next|prev>
-  rift-ergo rehome [workspace-name]"
+  rift-ergo rehome [workspace-name]\n  rift-ergo --log-path"
     );
 }
 
@@ -103,6 +147,7 @@ usage:
   rift-ergo move-follow <workspace-name>
   rift-ergo switch-workspace <workspace-name>
   rift-ergo switch-workspace-both <workspace-name>
+  rift-ergo switch-workspace-focused <workspace-name>
   rift-ergo move-window-to-display <next|prev>
   rift-ergo move-workspace-to-display <next|prev>
   rift-ergo rehome [workspace-name]",

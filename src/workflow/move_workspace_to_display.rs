@@ -23,6 +23,7 @@ enum MoveWorkspaceState {
     FocusOriginalWindow,
     Verify,
     Settle,
+    RestoreOrder,
     Complete,
 }
 
@@ -30,6 +31,14 @@ pub fn move_workspace_to_display(direction: DisplayDirection) -> Result<()> {
     let rift = Rift::connect()?;
     let displays = rift.displays()?;
     let source = rift.focused_workspace(&displays)?;
+    // Captured before anything moves, while the source workspace is still the
+    // focused one. Rift preserves workspace membership across a display
+    // transfer but not the tiled arrangement, so the order is replayed at the
+    // end from this snapshot. Failing to read it only forfeits the refinement.
+    let source_order = rift.tiled_order(None, None).unwrap_or_else(|error| {
+        crate::logging::warn(&format!("source visual order unavailable: {error}"));
+        Vec::new()
+    });
     let Some(target_display) = adjacent_display(&displays, &source.display_uuid, direction)? else {
         return Ok(());
     };
@@ -81,6 +90,7 @@ pub fn move_workspace_to_display(direction: DisplayDirection) -> Result<()> {
         workspace_name: &workspace_name,
         windows: &source.workspace.windows,
         focused_window: &source.focused_window,
+        source_order: &source_order,
     }
     .run()
 }
@@ -169,6 +179,7 @@ struct MoveWorkspaceWorkflow<'a> {
     workspace_name: &'a str,
     windows: &'a [WindowData],
     focused_window: &'a WindowData,
+    source_order: &'a [WindowId],
 }
 
 impl MoveWorkspaceWorkflow<'_> {
@@ -203,6 +214,15 @@ impl MoveWorkspaceWorkflow<'_> {
                 }
                 MoveWorkspaceState::Settle => {
                     self.settle()?;
+                    MoveWorkspaceState::RestoreOrder
+                }
+                MoveWorkspaceState::RestoreOrder => {
+                    // Visual order is a refinement, not part of the move's
+                    // contract: membership and focus are already confirmed.
+                    // A failure here must not fail the whole workflow.
+                    if let Err(error) = self.restore_visual_order() {
+                        crate::logging::warn(&format!("visual order not restored: {error}"));
+                    }
                     MoveWorkspaceState::Complete
                 }
                 MoveWorkspaceState::Complete => return Ok(()),
@@ -403,6 +423,66 @@ impl MoveWorkspaceWorkflow<'_> {
         self.verify()
     }
 
+    /// Replays the source workspace's tiled order onto the destination.
+    ///
+    /// Rift's display transfer preserves membership and focus but reinserts
+    /// windows in arrival order. Stable `node_id`s and a normalized container
+    /// tree (Rift 0.5.8.1) make the source order replayable as a permutation:
+    /// selection sort over the destination order, at most `n - 1` swaps.
+    ///
+    /// Only the windows this workflow moved participate, so windows that
+    /// already lived in the destination workspace are never disturbed.
+    fn restore_visual_order(&self) -> Result<()> {
+        if std::env::var_os("RIFT_ERGO_RESTORE_ORDER").is_some_and(|value| value == "0") {
+            return Ok(());
+        }
+
+        let moved = self.window_ids();
+        let desired: Vec<WindowId> = self
+            .source_order
+            .iter()
+            .copied()
+            .filter(|id| moved.contains(id))
+            .collect();
+        if desired.len() < 2 {
+            return Ok(());
+        }
+
+        let mut actual: Vec<WindowId> = self
+            .rift
+            .tiled_order(Some(self.target.space), Some(self.target.workspace_index))?
+            .into_iter()
+            .filter(|id| moved.contains(id))
+            .collect();
+
+        // A destination that does not hold exactly the moved set means the
+        // transfer landed differently than assumed; reordering it would be
+        // guesswork, so leave the layout alone and say so.
+        if actual.len() != desired.len() {
+            crate::logging::warn(&format!(
+                "visual order skipped: destination has {} of {} moved windows",
+                actual.len(),
+                desired.len()
+            ));
+            return Ok(());
+        }
+
+        let swaps = order_swaps(&desired, &mut actual);
+        for (first, second) in &swaps {
+            self.rift
+                .execute(self.rift.swap_windows_command(*first, *second))?;
+        }
+
+        if !swaps.is_empty() {
+            crate::logging::info(&format!(
+                "restored visual order for {} windows in {} swaps",
+                desired.len(),
+                swaps.len()
+            ));
+        }
+        Ok(())
+    }
+
     fn window_ids(&self) -> Vec<WindowId> {
         self.windows.iter().map(|window| window.id).collect()
     }
@@ -421,8 +501,74 @@ impl MoveWorkspaceWorkflow<'_> {
     }
 }
 
+/// Swaps that transform `actual` into `desired`, as selection sort.
+///
+/// Both slices must hold the same set of ids. `actual` is advanced in step so
+/// each emitted pair reflects the tree state Rift will see when that swap is
+/// applied, which keeps the command sequence valid without re-querying.
+fn order_swaps(desired: &[WindowId], actual: &mut [WindowId]) -> Vec<(WindowId, WindowId)> {
+    let mut swaps = Vec::new();
+    for index in 0..desired.len() {
+        if actual[index] == desired[index] {
+            continue;
+        }
+        let Some(found) = (index + 1..actual.len()).find(|&at| actual[at] == desired[index]) else {
+            continue;
+        };
+        swaps.push((actual[index], actual[found]));
+        actual.swap(index, found);
+    }
+    swaps
+}
+
 fn is_timeout(error: &crate::DynError) -> bool {
     error
         .downcast_ref::<io::Error>()
         .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(idx: u32) -> WindowId {
+        WindowId { pid: 1, idx }
+    }
+
+    fn ids(indices: &[u32]) -> Vec<WindowId> {
+        indices.iter().copied().map(window).collect()
+    }
+
+    #[test]
+    fn an_already_correct_order_needs_no_swaps() {
+        let desired = ids(&[1, 2, 3]);
+        let mut actual = ids(&[1, 2, 3]);
+        assert!(order_swaps(&desired, &mut actual).is_empty());
+    }
+
+    #[test]
+    fn swaps_transform_actual_into_desired() {
+        let desired = ids(&[1, 2, 3, 4]);
+        let mut actual = ids(&[3, 4, 1, 2]);
+        let swaps = order_swaps(&desired, &mut actual);
+        assert_eq!(actual, desired);
+        assert!(swaps.len() < desired.len());
+    }
+
+    #[test]
+    fn a_reversed_order_is_restored() {
+        let desired = ids(&[1, 2, 3, 4, 5]);
+        let mut actual = ids(&[5, 4, 3, 2, 1]);
+        order_swaps(&desired, &mut actual);
+        assert_eq!(actual, desired);
+    }
+
+    #[test]
+    fn a_single_transposition_costs_one_swap() {
+        let desired = ids(&[1, 2, 3]);
+        let mut actual = ids(&[2, 1, 3]);
+        let swaps = order_swaps(&desired, &mut actual);
+        assert_eq!(swaps, vec![(window(2), window(1))]);
+        assert_eq!(actual, desired);
+    }
 }

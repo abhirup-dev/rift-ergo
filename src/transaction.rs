@@ -15,6 +15,7 @@ const BATCH_SETUP_TIMEOUT: Duration = Duration::from_millis(2_500);
 const MIN_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 const STATE_PROBE_INTERVAL: Duration = Duration::from_millis(20);
 const STABLE_STATE_DURATION: Duration = Duration::from_millis(350);
+const SLOW_STEP_THRESHOLD: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Copy)]
 pub enum EventExpectation<'a> {
@@ -44,7 +45,7 @@ impl EventExpectation<'_> {
 }
 
 enum EventMessage {
-    Event(RiftEvent),
+    Event(Box<RiftEvent>),
     Error(String),
 }
 
@@ -200,6 +201,10 @@ impl<'a> RiftTransaction<'a> {
             }
         }
 
+        crate::logging::warn(&format!(
+            "timeout waiting for stable {description} after {} ms",
+            started.elapsed().as_millis()
+        ));
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("timed out waiting for stable {description}"),
@@ -255,6 +260,10 @@ impl<'a> RiftTransaction<'a> {
             return Ok(());
         }
 
+        crate::logging::warn(&format!(
+            "timeout waiting for {description} after {} ms",
+            started.elapsed().as_millis()
+        ));
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("timed out waiting for {description}"),
@@ -315,7 +324,7 @@ fn start_event_reader(subscription: rift_client::RiftMachSubscription) -> Receiv
                     if !is_transition_event(&event) {
                         continue;
                     }
-                    if tx.send(EventMessage::Event(event)).is_err() {
+                    if tx.send(EventMessage::Event(Box::new(event))).is_err() {
                         return;
                     }
                 }
@@ -335,6 +344,7 @@ fn is_transition_event(event: &RiftEvent) -> bool {
         RiftEvent::WorkspaceChanged { .. }
             | RiftEvent::WindowsChanged { .. }
             | RiftEvent::FocusedWindowChanged { .. }
+            | RiftEvent::LayoutChanged { .. }
     )
 }
 
@@ -342,7 +352,9 @@ fn event_workspace(event: &RiftEvent) -> Option<&str> {
     match event {
         RiftEvent::WorkspaceChanged { workspace_name, .. }
         | RiftEvent::WindowsChanged { workspace_name, .. }
-        | RiftEvent::FocusedWindowChanged { workspace_name, .. } => Some(workspace_name),
+        | RiftEvent::FocusedWindowChanged { workspace_name, .. }
+        | RiftEvent::LayoutChanged { workspace_name, .. }
+        | RiftEvent::SelectionChanged { workspace_name, .. } => Some(workspace_name),
         RiftEvent::WindowTitleChanged { .. } | RiftEvent::StacksChanged { .. } => None,
     }
 }
@@ -353,6 +365,14 @@ fn trace_wait(description: &str, completion: &str, elapsed: Duration) {
             "rift-ergo: {description} completed by {completion} in {} ms",
             elapsed.as_millis()
         );
+    }
+    // A step that takes this long still succeeded, but it is the earliest
+    // signal that Rift's confirmation path has regressed.
+    if elapsed >= SLOW_STEP_THRESHOLD {
+        crate::logging::warn(&format!(
+            "slow {description} completed by {completion} in {} ms",
+            elapsed.as_millis()
+        ));
     }
 }
 
