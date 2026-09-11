@@ -5,6 +5,7 @@ mod placement;
 mod rehome;
 mod switch_workspace;
 mod switch_workspace_both;
+mod switch_workspace_focused;
 
 use rift_client::DisplayData;
 
@@ -16,6 +17,7 @@ pub use move_workspace_to_display::move_workspace_to_display;
 pub use rehome::rehome;
 pub use switch_workspace::switch_workspace;
 pub use switch_workspace_both::switch_workspace_both;
+pub use switch_workspace_focused::switch_workspace_focused;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisplayDirection {

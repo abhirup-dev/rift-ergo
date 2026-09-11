@@ -314,6 +314,7 @@ mod tests {
             bundle_id: Some("com.example.app".into()),
             app_name: Some("Example".into()),
             window_server_id: Some(7),
+            layout_position: None,
         }
     }
 

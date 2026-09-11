@@ -1,7 +1,7 @@
 # rift-ergo
 
 Fast ergonomic workflows for the local Rift setup. `rift-ergo` is pinned to
-the installed Rift v0.5.3 revision and talks directly to Rift's Mach service
+the installed Rift v0.5.5 revision and talks directly to Rift's Mach service
 through the typed `rift-client` API. It does not shell out to `rift-cli`.
 
 The helper is intentionally an orchestration layer, not a second window
@@ -13,6 +13,9 @@ queries, and events all use Rift's native primitives.
 | Command | Current binding | Behavior |
 | --- | --- | --- |
 | `rift-ergo move-follow <workspace>` | `Option+Shift+X` for each configured workspace key | Move the focused window to the workspace and its policy-selected display, then follow it. |
+| `rift-ergo switch-workspace <workspace>` | `Option+X` for each configured workspace key | Activate the workspace on the display the profile assigns it to. |
+| `rift-ergo switch-workspace-both <workspace>` | `Option+Ctrl+X` for each configured workspace key | Activate the workspace on every display, returning focus to the display it started on. |
+| `rift-ergo switch-workspace-focused <workspace>` | — (Raycast extension) | Activate the workspace on the focused display only. |
 | `rift-ergo move-window-to-display <next\|prev>` | `Option+Shift+\`` (`next`) | Move the focused window to the workspace currently active on the adjacent display, then follow it. |
 | `rift-ergo move-workspace-to-display <next\|prev>` | `Option+Shift+Tab` (`next`) | Move every window in the focused workspace to the adjacent display while preserving workspace membership and restoring focus. |
 | `rift-ergo rehome [workspace]` | `Option+Shift+0` (focused workspace) | Move policy-matched windows from one selected workspace to their configured workspace and display homes. |
