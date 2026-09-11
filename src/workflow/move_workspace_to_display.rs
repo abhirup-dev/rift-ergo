@@ -433,7 +433,7 @@ impl MoveWorkspaceWorkflow<'_> {
     /// Only the windows this workflow moved participate, so windows that
     /// already lived in the destination workspace are never disturbed.
     fn restore_visual_order(&self) -> Result<()> {
-        if std::env::var_os("RIFT_ERGO_RESTORE_ORDER").is_some_and(|value| value == "0") {
+        if restore_order_disabled() {
             return Ok(());
         }
 
@@ -499,6 +499,23 @@ impl MoveWorkspaceWorkflow<'_> {
             .filter(|window| window_ids.contains(&window.id))
             .collect()
     }
+}
+
+/// Whether order restoration is switched off.
+///
+/// Rift invokes bindings as an argv array with no shell, so an environment
+/// variable cannot be set per binding. The sentinel file is the switch that is
+/// actually reachable from a keybinding-driven setup: create it to disable,
+/// remove it to re-enable, no rebuild and no config edit.
+fn restore_order_disabled() -> bool {
+    if std::env::var_os("RIFT_ERGO_RESTORE_ORDER").is_some_and(|value| value == "0") {
+        return true;
+    }
+    std::env::var_os("HOME").is_some_and(|home| {
+        std::path::Path::new(&home)
+            .join(".config/rift/rift-ergo.no-restore-order")
+            .exists()
+    })
 }
 
 /// Swaps that transform `actual` into `desired`, as selection sort.

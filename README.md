@@ -133,7 +133,11 @@ primitive in at most `n - 1` commands. Only the moved windows participate, so
 windows already living in the destination workspace are left untouched.
 
 This became practical in Rift 0.5.8.1, which gives container tree nodes stable
-`node_id`s and target frames. Set `RIFT_ERGO_RESTORE_ORDER=0` to disable it.
+`node_id`s and target frames.
+
+To disable it, create `~/.config/rift/rift-ergo.no-restore-order`; delete the
+file to re-enable. Rift runs bindings as an argv array with no shell, so
+`RIFT_ERGO_RESTORE_ORDER=0` is only usable when invoking the binary by hand.
 Restoration never fails the move: membership and focus are confirmed first, and
 a reordering failure is logged rather than propagated.
 
