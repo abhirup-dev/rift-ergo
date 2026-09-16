@@ -49,6 +49,11 @@ pub fn move_workspace_to_display(direction: DisplayDirection) -> Result<()> {
         crate::logging::info(&format!(
             "workspace {workspace_name} has no windows; nothing to move"
         ));
+        crate::notify::notify(
+            crate::notify::Outcome::Failed,
+            "rift-ergo: nothing to move",
+            &format!("workspace {workspace_name} has no windows"),
+        );
         return Ok(());
     };
 
@@ -130,7 +135,16 @@ impl MoveWorkspaceWorkflow<'_> {
                     self.settle()?;
                     MoveWorkspaceState::Complete
                 }
-                MoveWorkspaceState::Complete => return Ok(()),
+                MoveWorkspaceState::Complete => {
+                    crate::notify::summarize(format!(
+                        "{} window{} to workspace {} on {}",
+                        self.windows.len(),
+                        if self.windows.len() == 1 { "" } else { "s" },
+                        self.workspace_name,
+                        self.target.display_name()
+                    ));
+                    return Ok(());
+                }
             };
         }
     }

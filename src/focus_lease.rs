@@ -26,9 +26,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const LEASE_WINDOW_MS: u64 = 2_000;
 
 /// Held after the last step, for the focus events a settling workflow emits.
-/// Measured: Rift publishes them up to about a second after a workflow
-/// returns, so this is deliberately longer than the settle itself.
-const RELEASE_GRACE_MS: u64 = 1_500;
+/// Measured: Rift published one 2.1 s after a workflow returned and the hook
+/// answered it by pulling a different workspace forward, so the grace is
+/// longer than the longest tail seen. The cost is that a raise you perform
+/// yourself within this window of a binding is ignored; the hook only matters
+/// when Rift's own auto-switch fails, so that trade is cheap.
+const RELEASE_GRACE_MS: u64 = 2_500;
 
 /// A hook that died without cleaning up must not suppress the next one forever.
 const SINGLE_FLIGHT_STALE_MS: u64 = 5_000;
@@ -103,7 +106,12 @@ impl Drop for SingleFlight {
 
 /// `None` when another hook invocation holds the marker.
 pub fn try_single_flight() -> Option<SingleFlight> {
-    let path = lock_path();
+    try_single_flight_at(lock_path())
+}
+
+/// The same exclusion for hooks that keep their own marker, such as the
+/// new-window reconciler.
+pub fn try_single_flight_at(path: PathBuf) -> Option<SingleFlight> {
     if claim(&path) {
         return Some(SingleFlight { path });
     }

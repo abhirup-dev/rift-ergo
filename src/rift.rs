@@ -43,6 +43,8 @@ impl FocusedWorkspace {
 
 pub struct TargetContext {
     pub display_uuid: String,
+    /// macOS's name for the display, for messages a human reads.
+    display_name: Option<String>,
     pub space: u64,
     pub frame: Rect,
     pub workspace_index: usize,
@@ -50,6 +52,15 @@ pub struct TargetContext {
     pub workspace_is_active: bool,
     pub focus_anchor: Option<WindowData>,
     frame_validation: FrameValidation,
+}
+
+impl TargetContext {
+    /// The display as a human would name it, falling back to the UUID prefix.
+    pub fn display_name(&self) -> String {
+        self.display_name
+            .clone()
+            .unwrap_or_else(|| self.display_uuid.chars().take(8).collect())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +122,7 @@ impl Rift {
 
         Ok(TargetContext {
             display_uuid,
+            display_name: display.name.clone(),
             space,
             frame: display.frame,
             workspace_index: workspace.index,
@@ -170,16 +182,21 @@ impl Rift {
         })
     }
 
-    /// The workspace a keybinding refers to: the active workspace of the
-    /// display macOS reports as active, which is also the display Rift routes
-    /// layout commands to.
+    /// The workspace a keybinding refers to.
     ///
-    /// The key window is recorded when it belongs to that workspace but is not
-    /// required. Requiring it made every workspace-scoped binding fail whenever
-    /// focus rested on an unmanaged window, and the workspace on screen is
-    /// unambiguous without it. If the active display has no space Rift manages
-    /// -- it is showing a native-fullscreen space -- fall back to whichever
-    /// display holds the key window.
+    /// The key window decides, not the display macOS reports as active. Both
+    /// normally agree, and a hard focus drives both within 150 ms (measured
+    /// 24/24). They come apart when something moves focus between the keypress
+    /// and this call -- Rift's auto-switch on app activation, or the
+    /// focus-follow hook -- and acting on the stale one relocates the *other*
+    /// monitor's workspace, which is silent and destructive. The key window is
+    /// what the user last typed into, so it wins; `display_is_active` on the
+    /// returned context tells the caller whether Rift's command routing has to
+    /// be moved there first.
+    ///
+    /// The key window is not required: focus resting on an unmanaged window --
+    /// Finder's desktop, a native-fullscreen space -- is common at the moment a
+    /// binding fires, and the workspace on screen is unambiguous without it.
     pub fn focused_workspace(&self, displays: &[DisplayData]) -> Result<FocusedWorkspace> {
         let active_display = displays
             .iter()
@@ -187,9 +204,22 @@ impl Rift {
             .filter(|display| display_space(display).is_some());
         if let Some(display) = active_display {
             let space = display_space(display).expect("filtered above");
-            let workspace = self
-                .client
-                .get_workspaces(Some(space))?
+            let workspaces = self.client.get_workspaces(Some(space))?;
+            let key_window_is_here = workspaces
+                .iter()
+                .any(|workspace| workspace.windows.iter().any(|window| window.is_focused));
+            if !key_window_is_here
+                && let Some(elsewhere) =
+                    self.workspace_holding_key_window(displays, &display.uuid)?
+            {
+                crate::logging::warn(&format!(
+                    "key window is on {} workspace {} while Rift's active context is {}; \
+                     following the key window",
+                    elsewhere.display_uuid, elsewhere.workspace.name, display.uuid
+                ));
+                return Ok(elsewhere);
+            }
+            let workspace = workspaces
                 .into_iter()
                 .find(|workspace| workspace.is_active)
                 .ok_or_else(|| state_error("active display has no active Rift workspace"))?;
@@ -225,6 +255,79 @@ impl Rift {
             }
         }
         Err(state_error("no focused Rift-managed window"))
+    }
+
+    /// The display showing the key window, when it is not the one passed in.
+    ///
+    /// Returns that display's *active* workspace rather than the key window's
+    /// own: what the user sees is what a workspace-scoped binding means, and a
+    /// key window parked in a hidden workspace is the broken state the
+    /// focus-follow hook exists to repair.
+    fn workspace_holding_key_window(
+        &self,
+        displays: &[DisplayData],
+        skip_display_uuid: &str,
+    ) -> Result<Option<FocusedWorkspace>> {
+        for display in displays {
+            if display.uuid == skip_display_uuid {
+                continue;
+            }
+            let Some(space) = display_space(display) else {
+                continue;
+            };
+            let workspaces = self.client.get_workspaces(Some(space))?;
+            let Some(key_window) = workspaces
+                .iter()
+                .flat_map(|workspace| workspace.windows.iter())
+                .find(|window| window.is_focused)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(workspace) = workspaces.into_iter().find(|workspace| workspace.is_active)
+            else {
+                continue;
+            };
+            let focused_window = workspace
+                .windows
+                .iter()
+                .any(|window| window.id == key_window.id)
+                .then_some(key_window);
+            return Ok(Some(FocusedWorkspace {
+                display_uuid: display.uuid.clone(),
+                workspace,
+                focused_window,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// A window by id, or `None` when Rift does not manage it.
+    ///
+    /// A window Rift has just discovered is addressable by exact id before it
+    /// appears in any workspace snapshot, which is how the new-window hook sees
+    /// launches that would otherwise be missed.
+    pub fn window_info(&self, window_id: WindowId) -> Option<WindowData> {
+        self.client.get_window_info(window_id).ok()
+    }
+
+    /// Every window Rift manages, with where it currently lives.
+    pub fn window_locations(
+        &self,
+        displays: &[DisplayData],
+    ) -> Result<Vec<(String, String, WindowData)>> {
+        let mut located = Vec::new();
+        for display in displays {
+            let Some(space) = display_space(display) else {
+                continue;
+            };
+            for workspace in self.client.get_workspaces(Some(space))? {
+                for window in workspace.windows {
+                    located.push((display.uuid.clone(), workspace.name.clone(), window));
+                }
+            }
+        }
+        Ok(located)
     }
 
     /// Workspace `name` on each managed display, for callers that decide by

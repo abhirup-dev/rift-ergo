@@ -1,5 +1,6 @@
 mod focus_lease;
 mod logging;
+mod notify;
 mod policy;
 mod rift;
 mod space_escape;
@@ -16,16 +17,29 @@ type Result<T> = std::result::Result<T, DynError>;
 
 fn main() {
     let invocation: Vec<String> = env::args().skip(1).collect();
+    // Hooks are invoked with the whole event JSON appended, which is unreadable
+    // in a notification title; the command alone identifies what ran.
+    let command = invocation.first().cloned().unwrap_or_default();
     let started = Instant::now();
     logging::info(&format!("invoke [{}]", invocation.join(" ")));
 
     match run() {
         Ok(()) => {
-            logging::info(&format!(
-                "ok [{}] in {} ms",
-                invocation.join(" "),
-                started.elapsed().as_millis()
-            ));
+            let elapsed = started.elapsed().as_millis();
+            logging::info(&format!("ok [{}] in {} ms", invocation.join(" "), elapsed));
+            if let Some(summary) = notify::summary() {
+                notify::notify(
+                    notify::Outcome::Moved,
+                    &format!("rift-ergo: {command}"),
+                    &format!("{summary} ({elapsed} ms)"),
+                );
+            } else {
+                notify::notify(
+                    notify::Outcome::Quiet,
+                    &format!("rift-ergo: {command}"),
+                    &format!("done in {elapsed} ms"),
+                );
+            }
         }
         Err(error) => {
             // Rift's Mach transport surfaces its own failures verbatim; attribute
@@ -43,6 +57,11 @@ fn main() {
                     invocation.join(" "),
                     started.elapsed().as_millis()
                 ),
+            );
+            notify::notify(
+                notify::Outcome::Failed,
+                &format!("rift-ergo: {command} failed"),
+                &text,
             );
             eprintln!("rift-ergo: {error}");
             std::process::exit(1);
@@ -66,6 +85,7 @@ fn run() -> Result<()> {
             | "move-window-to-display"
             | "move-workspace-to-display"
             | "rehome"
+            | "on-windows-changed"
     );
     if holds_focus_lease {
         focus_lease::renew();
@@ -117,6 +137,14 @@ fn dispatch(command: &str, args: &mut impl Iterator<Item = String>) -> Result<()
             require_no_more_arguments(args)?;
             workflow::move_workspace_to_display(direction)
         }
+        "on-windows-changed" => {
+            let first = args.next();
+            require_no_more_arguments(args)?;
+            match first.as_deref() {
+                Some("--init") => workflow::init_seen(),
+                event => workflow::on_windows_changed(event),
+            }
+        }
         "on-focus-change" => {
             let event = args.next();
             require_no_more_arguments(args)?;
@@ -150,6 +178,7 @@ fn print_usage() {
   rift-ergo move-window-to-display <next|prev>
   rift-ergo move-workspace-to-display <next|prev>
   rift-ergo on-focus-change <event-json>
+  rift-ergo on-windows-changed [--init | <event-json>]
   rift-ergo rehome [workspace-name]\n  rift-ergo --log-path"
     );
 }

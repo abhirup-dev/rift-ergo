@@ -24,6 +24,7 @@ queries, and events all use Rift's native primitives.
 | `rift-ergo move-window-to-display <next\|prev>` | `Option+Shift+\`` (`next`) | Move the focused window to the workspace currently active on the adjacent display, then follow it. |
 | `rift-ergo move-workspace-to-display <next\|prev>` | `Option+Shift+Tab` (`next`) | Move every window in the focused workspace to the adjacent display while preserving workspace membership and restoring focus. |
 | `rift-ergo on-focus-change <event-json>` | — (Rift `subscribe cli` hook) | Show a focused window's workspace when Rift's own auto-switch dropped it. |
+| `rift-ergo on-windows-changed [--init\|<event-json>]` | — (Rift `subscribe cli` hook) | Place a newly created window on its configured display, once, the first time it is seen. |
 | `rift-ergo rehome [workspace]` | `Option+Shift+0` (focused workspace) | Move policy-matched windows from one selected workspace to their configured workspace and display homes. |
 
 Workspace arguments are Rift workspace names, including numeric names such as
@@ -60,6 +61,18 @@ that had it, and verifies once the state is stable. Transfers are sequential
 because Rift drops a queued transfer of the focused window, and the focused
 window goes last so Rift's raise-on-transfer leaves focus where the workflow
 wants it. Bounded reconciliation runs only if a transfer landed elsewhere.
+
+### Which workspace a command starts from
+
+The source workspace follows the **key window**, not the display macOS reports
+as active. The two disagree often enough to matter: focus and the active-menu-bar
+display are updated by separate asynchronous paths, and a workspace move issued
+in the gap between them runs on the wrong display. Two of three early
+`move-workspace-to-display` runs went the wrong way for exactly this reason. A
+three-way probe showed the APIs themselves agree 24 out of 24 times within
+150 ms, so the disagreement is not a stale read -- something moved focus between
+the check and the command. Reading the key window instead makes the source the
+window the user is actually looking at.
 
 ### How Rift's commands are scoped
 
@@ -128,6 +141,64 @@ Measured over nine cross-display `switch-workspace-both` runs: the hook would
 have fired 8 and 10 times in two unleased runs, and fired 0 times with the lease,
 with no change in workflow failures.
 
+### `on-windows-changed`
+
+Rift's own `app_rules` already assign a workspace to a new window, but they
+resolve it inside the space the window was born in. A rule therefore means
+"workspace 7 of whichever display macOS happened to open this app on"; no
+version of Rift can express "workspace 7 of the builtin", and the maintainer has
+said multi-display policy will stay second class for some time, reachable
+through the CLI and IPC hooks. That gap is the whole reason this hook exists.
+It fixes the display first, then re-asserts the workspace, because a display
+transfer drops a window into whatever workspace the destination is showing.
+
+It is deliberately not a reconciler over all windows. Each window is placed once,
+the first time it is seen, so moving a window yourself afterwards sticks. A
+window that fails to land stays marked as seen rather than being retried on every
+later event -- retrying is how the script this replaces fought the user for
+placement.
+
+State lives in three files: `/tmp/rift-new-window-seen.json` (the placed set),
+`/tmp/rift-new-window-ready` (the pid of the Rift the baseline belongs to), and
+`/tmp/rift-new-window.lock` (single flight). `~/.config/rift/scripts/install-new-window-reconciler`
+runs `on-windows-changed --init` at startup to record every existing window as
+already placed, so a Rift restart re-derives nothing; events arriving before that
+baseline lands are ignored, because they would treat the whole desktop as new.
+
+Readiness is checked by reading the process table directly rather than with
+`pgrep`. In the environment Rift spawns hooks in, `pgrep -x rift` and even a bare
+`pgrep rift` return nothing while `ps` lists the daemon. The Python reconciler
+this replaces used `pgrep` for the same check, so its guard never passed and it
+never placed a window.
+
+`RIFT_ERGO_NEW_WINDOW=off` disables it; `=dry-run` logs the placements it would
+make. `RIFT_ERGO_NEW_WINDOW_STATE` points the placed set elsewhere, which is how
+a dry run is compared against the implementation currently in charge without
+stealing its state.
+
+### Notifications
+
+Keybindings run through Rift's `exec`, which discards stderr, so a workflow that
+fails -- or that refuses to act because the state was ambiguous -- is invisible
+at the moment it matters. The log records everything, but nobody reads a log
+after pressing a hotkey. A notification is fired after the work completes and
+never waited on, so it costs the workflow nothing.
+
+`RIFT_ERGO_NOTIFY` selects what is worth interrupting for:
+
+| Value | Notifies on |
+| --- | --- |
+| `off` | nothing |
+| `errors` | failures and refusals |
+| `moves` | the default: failures, refusals, and commands that relocated windows |
+| `all` | every invocation |
+
+Workspace switches are silent under the default because they are self-evident on
+screen and fire constantly. A workflow that moved something records what it did
+through `notify::summarize`, so the body says "moved 3 windows to Built-in"
+rather than repeating the command line. Delivery is `terminal-notifier`, with
+`osascript` as the fallback if that Homebrew package disappears.
+
 ### `rehome`
 
 With no argument, `rehome` snapshots only the currently focused workspace.
@@ -188,6 +259,7 @@ rift-ergo/
     ├── main.rs                CLI parsing and command dispatch
     ├── policy.rs              Monitor profiles and window-home matching
     ├── focus_lease.rs         Suppression shared with the focus-follow hook
+    ├── notify.rs               Desktop notifications for keybinding-run commands
     ├── rift.rs                Typed Rift queries and command constructors
     ├── transaction.rs         Event/state confirmation with bounded deadlines
     └── workflow/
@@ -196,6 +268,7 @@ rift-ergo/
         ├── move_follow.rs
         ├── move_window_to_display.rs
         ├── focus_follow.rs
+        ├── new_window.rs
         ├── move_workspace_to_display.rs
         └── rehome.rs
 ```
@@ -217,7 +290,7 @@ distinguish a display.
 
 Keybindings run `rift-ergo` through Rift's `exec`, so stderr is discarded and a
 failing binding is otherwise silent. Every invocation appends to
-`~/Library/Logs/rift/rift-ergo.log`, next to the reconciler's log. Failures are
+`~/Library/Logs/rift/rift-ergo.log`. Failures are
 tagged `source=rift` or `source=rift-ergo` so a Rift regression is not mistaken
 for one here. `rift-ergo --log-path` prints the path; `RIFT_ERGO_LOG=off`
 disables it.
