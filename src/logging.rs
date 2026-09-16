@@ -84,6 +84,14 @@ pub fn error(source: &str, message: &str) {
 }
 
 /// Where the log is being written, for `rift-ergo --log-path`.
+/// Developer tracing to stderr, enabled by `RIFT_ERGO_TRACE`. Not written to
+/// the log file: it is for watching a run by hand.
+pub fn trace(message: &str) {
+    if env::var_os("RIFT_ERGO_TRACE").is_some() {
+        eprintln!("rift-ergo: {message}");
+    }
+}
+
 pub fn describe() -> String {
     path().map_or_else(
         || "disabled (RIFT_ERGO_LOG=off)".to_string(),

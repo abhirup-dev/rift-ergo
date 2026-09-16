@@ -1,7 +1,6 @@
 use rift_client::{
-    ContainerTreeNode, DisplayData, DisplaySelector, EventKind, LayoutCommand, ReactorCommand,
-    Rect, RiftCommand, RiftMachClient, RiftMachSubscription, WindowData, WindowId, WorkspaceData,
-    WorkspaceSelector,
+    DisplayData, DisplaySelector, EventKind, LayoutCommand, ReactorCommand, Rect, RiftCommand,
+    RiftMachClient, RiftMachSubscription, WindowData, WindowId, WorkspaceData, WorkspaceSelector,
 };
 
 use crate::{Result, state_error};
@@ -21,12 +20,31 @@ pub struct FocusedWindow {
 pub struct FocusedWorkspace {
     pub display_uuid: String,
     pub workspace: WorkspaceData,
-    pub focused_window: WindowData,
+    /// The window macOS reports as key, when it is one of this workspace's.
+    /// Absent when focus sits outside Rift's management -- Finder's desktop, a
+    /// native-fullscreen space, an unmanaged app -- which is common at the
+    /// moment a keybinding fires.
+    pub focused_window: Option<WindowData>,
+}
+
+impl FocusedWorkspace {
+    /// The window that should own focus once this workspace lands somewhere:
+    /// the key window if it is here, otherwise the first tiled window.
+    pub fn focus_target(&self) -> Option<&WindowData> {
+        self.focused_window.as_ref().or_else(|| {
+            self.workspace
+                .windows
+                .iter()
+                .find(|window| !window.is_floating)
+                .or_else(|| self.workspace.windows.first())
+        })
+    }
 }
 
 pub struct TargetContext {
     pub display_uuid: String,
     pub space: u64,
+    pub frame: Rect,
     pub workspace_index: usize,
     pub display_is_active: bool,
     pub workspace_is_active: bool,
@@ -94,6 +112,7 @@ impl Rift {
         Ok(TargetContext {
             display_uuid,
             space,
+            frame: display.frame,
             workspace_index: workspace.index,
             display_is_active: display.is_active_context,
             workspace_is_active: workspace.is_active,
@@ -138,8 +157,11 @@ impl Rift {
 
     pub fn focused_window(&self, displays: &[DisplayData]) -> Result<FocusedWindow> {
         let focused = self.focused_workspace(displays)?;
+        let window = focused
+            .focused_window
+            .ok_or_else(|| state_error("no focused Rift-managed window"))?;
         Ok(FocusedWindow {
-            window: focused.focused_window,
+            window,
             location: WindowLocation {
                 display_uuid: focused.display_uuid,
                 workspace_name: focused.workspace.name,
@@ -148,34 +170,85 @@ impl Rift {
         })
     }
 
+    /// The workspace a keybinding refers to: the active workspace of the
+    /// display macOS reports as active, which is also the display Rift routes
+    /// layout commands to.
+    ///
+    /// The key window is recorded when it belongs to that workspace but is not
+    /// required. Requiring it made every workspace-scoped binding fail whenever
+    /// focus rested on an unmanaged window, and the workspace on screen is
+    /// unambiguous without it. If the active display has no space Rift manages
+    /// -- it is showing a native-fullscreen space -- fall back to whichever
+    /// display holds the key window.
     pub fn focused_workspace(&self, displays: &[DisplayData]) -> Result<FocusedWorkspace> {
+        let active_display = displays
+            .iter()
+            .find(|display| display.is_active_context)
+            .filter(|display| display_space(display).is_some());
+        if let Some(display) = active_display {
+            let space = display_space(display).expect("filtered above");
+            let workspace = self
+                .client
+                .get_workspaces(Some(space))?
+                .into_iter()
+                .find(|workspace| workspace.is_active)
+                .ok_or_else(|| state_error("active display has no active Rift workspace"))?;
+            let focused_window = workspace
+                .windows
+                .iter()
+                .find(|window| window.is_focused)
+                .cloned();
+            return Ok(FocusedWorkspace {
+                display_uuid: display.uuid.clone(),
+                workspace,
+                focused_window,
+            });
+        }
+
         for display in displays {
             let Some(space) = display_space(display) else {
                 continue;
             };
-            let focused_window = self
-                .client
-                .get_windows(Some(space))?
-                .into_iter()
-                .find(|window| window.is_focused);
-            let Some(focused_window) = focused_window else {
-                continue;
-            };
             for workspace in self.client.get_workspaces(Some(space))? {
-                if workspace
+                let focused_window = workspace
                     .windows
                     .iter()
-                    .any(|window| window.id == focused_window.id)
-                {
+                    .find(|window| window.is_focused)
+                    .cloned();
+                if let Some(focused_window) = focused_window {
                     return Ok(FocusedWorkspace {
                         display_uuid: display.uuid.clone(),
-                        focused_window,
                         workspace,
+                        focused_window: Some(focused_window),
                     });
                 }
             }
         }
         Err(state_error("no focused Rift-managed window"))
+    }
+
+    /// Workspace `name` on each managed display, for callers that decide by
+    /// where a workspace has windows.
+    pub fn workspace_on_each_display(
+        &self,
+        workspace_name: &str,
+        displays: &[DisplayData],
+    ) -> Result<Vec<(DisplayData, WorkspaceData)>> {
+        let mut found = Vec::new();
+        for display in displays {
+            let Some(space) = display_space(display) else {
+                continue;
+            };
+            if let Some(workspace) = self
+                .client
+                .get_workspaces(Some(space))?
+                .into_iter()
+                .find(|workspace| workspace.name == workspace_name)
+            {
+                found.push((display.clone(), workspace));
+            }
+        }
+        Ok(found)
     }
 
     /// Workspaces on a macOS space, in configured order.
@@ -192,19 +265,31 @@ impl Rift {
         Ok(())
     }
 
-    pub fn focus_destination_command(&self, target: &TargetContext) -> RiftCommand {
-        let command = target.focus_anchor.as_ref().map_or_else(
-            || {
-                ReactorCommand::MoveMouseToDisplay(DisplaySelector::Uuid(
-                    target.display_uuid.clone(),
-                ))
-            },
-            |anchor| ReactorCommand::FocusWindow {
-                window_id: anchor.id,
-                window_server_id: anchor.window_server_id,
-            },
-        );
-        RiftCommand::Reactor(command)
+    /// A window Rift manages in `workspace_name` on the target's space, used
+    /// to give an inactive display a key window when its visible workspace
+    /// offers none. Only that workspace: raising a hidden window makes Rift
+    /// bring its workspace forward a moment later, which is welcome when it is
+    /// the workspace being switched to and a regression for any other.
+    pub fn hidden_anchor(
+        &self,
+        target: &TargetContext,
+        workspace_name: &str,
+    ) -> Result<Option<WindowData>> {
+        Ok(self
+            .workspaces(target.space)?
+            .into_iter()
+            .filter(|workspace| workspace.name == workspace_name)
+            .flat_map(|workspace| workspace.windows)
+            .find(|window| !window.is_floating))
+    }
+
+    /// Any tiled window Rift manages on the target's space, in any workspace.
+    pub fn any_hidden_window(&self, target: &TargetContext) -> Result<Option<WindowData>> {
+        Ok(self
+            .workspaces(target.space)?
+            .into_iter()
+            .flat_map(|workspace| workspace.windows)
+            .find(|window| !window.is_floating))
     }
 
     pub fn activate_workspace_command(&self, target: &TargetContext) -> RiftCommand {
@@ -250,29 +335,6 @@ impl Rift {
         })
     }
 
-    pub fn swap_windows_command(&self, first: WindowId, second: WindowId) -> RiftCommand {
-        RiftCommand::Layout(LayoutCommand::SwapWindows(first, second))
-    }
-
-    /// Tiled windows of a workspace in Rift's visual order.
-    ///
-    /// The container tree is a normalized topology, so a depth-first
-    /// left-to-right walk yields the same order the layout engine draws for
-    /// every mode it supports. Node identity became stable in Rift 0.5.8.1,
-    /// which is what makes this order usable as a replay target.
-    pub fn tiled_order(
-        &self,
-        space: Option<u64>,
-        workspace_index: Option<usize>,
-    ) -> Result<Vec<WindowId>> {
-        let layout = self
-            .client
-            .get_workspace_layout_state(space, workspace_index)?;
-        let mut order = Vec::new();
-        collect_tiled_leaves(&layout.container_tree, &mut order);
-        Ok(order)
-    }
-
     pub fn display_is_active(&self, display_uuid: &str) -> Result<bool> {
         Ok(self
             .client
@@ -313,30 +375,32 @@ impl Rift {
         if self.window_location(target, window_id)?.is_none() {
             return Ok(false);
         }
+        // Deliberately the observed frame, not the layout engine's view. This
+        // confirms that a physical display transfer landed, and Rift moves
+        // virtual workspace membership independently of the window itself: a
+        // window can be tiled in the destination workspace while still sitting
+        // on the source display. Asking the engine here reports success for a
+        // move that has not happened, which then cannot be reconciled by the
+        // later phases, since those read geometry.
         let window = self.client.get_window_info(window_id)?;
-        if frame_matches_display(&window.frame, target.frame_validation) {
-            return Ok(true);
-        }
-        // Only once geometry has said no. This runs inside the confirmation
-        // poll loop, so querying the layout engine first would add a Mach
-        // round-trip per window per iteration, contending with the reactor
-        // precisely while it is applying layout. On the negative path the
-        // caller would otherwise loop anyway, so the query is free in
-        // practice, and the engine decides a window's target frame before any
-        // animation -- which is exactly where a mid-animation AX frame lies.
-        self.layout_tiles_window(target, window_id)
+        Ok(physically_on_target(&window, target))
     }
 
-    /// Whether Rift's layout engine tiles `window_id` in the target workspace.
-    ///
-    /// A `false` result is not evidence of absence: the window may be floating,
-    /// or the engine may not track it in this workspace, so callers fall back
-    /// to their own check rather than treating this as authoritative denial.
-    fn layout_tiles_window(&self, target: &TargetContext, window_id: WindowId) -> Result<bool> {
-        let layout = self
-            .client
-            .get_workspace_layout_state(Some(target.space), Some(target.workspace_index))?;
-        Ok(layout.tiled_windows.contains(&window_id))
+    /// Whether the workspace shown on the target display contains the window
+    /// Rift reports focused: the sign that a display focus has fully landed and
+    /// a workspace switch there will not be undone by a late refocus.
+    pub fn active_workspace_has_focus(&self, target: &TargetContext) -> Result<bool> {
+        Ok(self
+            .workspaces(target.space)?
+            .iter()
+            .filter(|workspace| workspace.is_active)
+            .flat_map(|workspace| workspace.windows.iter())
+            .any(|window| window.is_focused))
+    }
+
+    /// Whether Rift reports `window_id` as the focused window.
+    pub fn window_is_focused(&self, window_id: WindowId) -> Result<bool> {
+        Ok(self.client.get_window_info(window_id)?.is_focused)
     }
 
     pub fn window_is_focused_at(
@@ -369,10 +433,7 @@ impl Rift {
                 .windows
                 .iter()
                 .any(|window| window.id == *window_id)
-                || !frame_matches_display(
-                    &self.client.get_window_info(*window_id)?.frame,
-                    target.frame_validation,
-                )
+                || !physically_on_target(&self.client.get_window_info(*window_id)?, target)
             {
                 return Ok(false);
             }
@@ -399,10 +460,7 @@ impl Rift {
                     .any(|window| window.id == *window_id)
             });
             if !is_member
-                || !frame_matches_display(
-                    &self.client.get_window_info(*window_id)?.frame,
-                    target.frame_validation,
-                )
+                || !physically_on_target(&self.client.get_window_info(*window_id)?, target)
             {
                 missing.push(*window_id);
             }
@@ -442,6 +500,16 @@ fn frame_validation(
     displays: &[DisplayData],
     layout_mode: &str,
 ) -> FrameValidation {
+    // Scrolling parks off-viewport windows outside the display's bounds -- far
+    // to the left on a horizontal strip, far below on a vertical one -- so a
+    // window that is correctly placed still fails an axis containment test.
+    // This has to precede the axis checks: when displays are disjoint on an
+    // axis the check below returns first, and on a vertically stacked pair the
+    // scrolling case was never reached at all.
+    if layout_mode == "scrolling" {
+        return FrameValidation::MembershipOnly;
+    }
+
     let vertically_disjoint = displays
         .iter()
         .filter(|display| display.uuid != target.uuid)
@@ -455,10 +523,6 @@ fn frame_validation(
         });
     if vertically_disjoint {
         return FrameValidation::Vertical(target.frame);
-    }
-
-    if layout_mode == "scrolling" {
-        return FrameValidation::MembershipOnly;
     }
 
     let horizontally_disjoint = displays
@@ -479,17 +543,26 @@ fn frame_validation(
     }
 }
 
-fn collect_tiled_leaves(node: &ContainerTreeNode, order: &mut Vec<WindowId>) {
-    if let Some(window_id) = node.window_id {
-        order.push(window_id);
-    }
-    for child in &node.children {
-        collect_tiled_leaves(child, order);
-    }
-}
-
 fn intervals_overlap(first_min: f64, first_max: f64, second_min: f64, second_max: f64) -> bool {
     first_min < second_max && second_min < first_max
+}
+
+/// Whether the WindowServer has `window` on the target display.
+///
+/// Rift moves virtual workspace membership independently of the window
+/// itself, so a window can be tiled in the destination workspace while still
+/// sitting on the source display; Rift then notices and pulls the membership
+/// back to match. The WindowServer's own space list for the window is the
+/// authoritative answer. The frame heuristic remains for the case where the
+/// private call is unavailable, and for windows Rift has no server id for.
+fn physically_on_target(window: &WindowData, target: &TargetContext) -> bool {
+    if let Some(spaces) = window
+        .window_server_id
+        .and_then(crate::space_escape::skylight::window_spaces)
+    {
+        return spaces.contains(&target.space);
+    }
+    frame_matches_display(&window.frame, target.frame_validation)
 }
 
 fn frame_matches_display(frame: &Rect, validation: FrameValidation) -> bool {

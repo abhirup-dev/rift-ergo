@@ -1,6 +1,8 @@
 use crate::Result;
-use crate::rift::{Rift, display_space};
-use crate::space_escape;
+use crate::rift::Rift;
+use crate::transaction::RiftTransaction;
+
+use super::placement;
 
 use super::switch_workspace::activate_on_display;
 
@@ -36,12 +38,10 @@ pub fn switch_workspace_both(workspace_name: &str) -> Result<()> {
         return Ok(());
     };
     // A no-op when the origin was the last display activated.
-    let space = displays
-        .iter()
-        .find(|display| display.uuid == origin)
-        .and_then(display_space);
-    if let Some(space) = space {
-        space_escape::focus_display(&rift, &origin, space)?;
+    let target = rift.target_context(workspace_name, origin, &displays)?;
+    if target.display_is_active {
+        return Ok(());
     }
-    Ok(())
+    let transaction = RiftTransaction::new(&rift)?;
+    placement::acquire_display(&rift, &transaction, &target, workspace_name)
 }

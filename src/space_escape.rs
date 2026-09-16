@@ -47,7 +47,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rift_client::DisplayData;
+use rift_client::{DisplayData, Rect};
 
 use crate::Result;
 use crate::rift::{Rift, display_space};
@@ -72,6 +72,7 @@ pub fn ensure_managed_space(
     rift: &Rift,
     display_uuid: &str,
     displays: Vec<DisplayData>,
+    preferred_workspace: Option<&str>,
 ) -> Result<Vec<DisplayData>> {
     let Some(display) = displays.iter().find(|display| display.uuid == display_uuid) else {
         return Ok(displays);
@@ -97,7 +98,7 @@ pub fn ensure_managed_space(
     // lives on the destination makes the WindowServer decide a Space change is
     // needed, and it then performs the real, fully composited leave-fullscreen
     // animation. This is all AeroSpace does, and why it needs no CGS calls.
-    if let Some(occupant) = occupant_bundle_id(rift, desktop)? {
+    if let Some(occupant) = occupant_bundle_id(rift, desktop, preferred_workspace)? {
         skylight::activate(&occupant);
         // The transition is asynchronous; without settling, Rift still reports
         // the old space and the caller reads a working switch as a failure.
@@ -121,17 +122,32 @@ pub fn ensure_managed_space(
     Ok(refreshed)
 }
 
-/// An application with a window on `space`, preferring the active workspace so
-/// focus lands where the caller wants it. Rift's own focus commands are no use
-/// here; they cannot cross out of a space Rift is not tracking.
-fn occupant_bundle_id(rift: &Rift, space: u64) -> Result<Option<String>> {
+/// An application whose activation leaves `space` showing what the caller
+/// wants: one with a window in the active workspace, or in
+/// `preferred_workspace` when the caller is about to show that workspace
+/// anyway. Rift's own focus commands are no use here; they cannot cross out of
+/// a space Rift is not tracking, and they ignore windows in hidden workspaces.
+///
+/// Never an application from any other workspace. Activating one raises its
+/// hidden window, and Rift answers by switching the display to that window's
+/// workspace -- so a switch to `2` would land on `A`, and windows transferred a
+/// moment later would arrive in `1`. Returning nothing and letting the caller
+/// fall back to the direct space switch is the safer failure.
+fn occupant_bundle_id(
+    rift: &Rift,
+    space: u64,
+    preferred_workspace: Option<&str>,
+) -> Result<Option<String>> {
     let workspaces = rift.workspaces(space)?;
-    let preferred = workspaces
+    let candidates = workspaces
         .iter()
-        .find(|workspace| workspace.is_active)
-        .into_iter()
-        .chain(workspaces.iter());
-    Ok(preferred
+        .filter(|workspace| workspace.is_active)
+        .chain(
+            workspaces
+                .iter()
+                .filter(|workspace| Some(workspace.name.as_str()) == preferred_workspace),
+        );
+    Ok(candidates
         .flat_map(|workspace| workspace.windows.iter())
         .find_map(|window| window.bundle_id.clone()))
 }
@@ -152,34 +168,154 @@ fn await_managed_space(rift: &Rift, display_uuid: &str) -> Result<Option<Vec<Dis
     Ok(None)
 }
 
-/// Make `display_uuid` the active display.
+/// Last resort for making a display active: click its desktop.
 ///
-/// `prepare_target` focuses a destination by focusing a window in that display's
-/// active workspace. When that workspace is empty there is no anchor, and the
-/// `MoveMouseToDisplay` fallback is inert unless `focus_follows_mouse` is
-/// enabled, so `prepare_target` waits for a focus that never arrives.
+/// macOS makes the display that owns the key window active, and Rift learns
+/// the active display from macOS. A display whose visible workspace is empty
+/// offers no window to focus, and Rift's own commands cannot help: `FocusDisplay`
+/// and `MoveMouseToDisplay` do nothing without a window there. A click on the
+/// desktop does make the display active -- on the primary display. On a
+/// secondary display macOS keeps the key window where it was, so this returns
+/// and the caller's wait times out; callers handle that by moving a window
+/// there first and focusing it.
 ///
-/// Activating an application on the display is enough to make it active, and is
-/// preferred for the same reason as in `ensure_managed_space`. Fall back to the
-/// direct space call only when the display has nothing to focus.
-///
-/// Best-effort, for the same reason as above.
-pub fn focus_display(rift: &Rift, display_uuid: &str, space: u64) -> Result<()> {
-    if rift.display_is_active(display_uuid)? {
-        return Ok(());
-    }
-    match occupant_bundle_id(rift, space)? {
-        Some(occupant) => skylight::activate(&occupant),
-        None => {
-            skylight::show_space(display_uuid, space);
-            skylight::activate(FOCUS_PARK_BUNDLE_ID);
-        }
-    }
-    Ok(())
+/// Parking focus on Finder, the previous fallback, never changed the active
+/// display and left Finder frontmost, which made Rift's next window raises
+/// miss for a couple of seconds.
+pub fn click_display(frame: Rect) -> bool {
+    pointer::click_desktop(frame)
 }
 
-/// Minimal binding to the private SkyLight space-switching call.
-mod skylight {
+/// Synthetic pointer input, for the one thing no window-manager command can
+/// do: make a display active when it shows nothing that can take focus.
+mod pointer {
+    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::sync::OnceLock;
+    use std::thread;
+    use std::time::Duration;
+
+    use rift_client::Rect;
+
+    const RTLD_LAZY: c_int = 1;
+    const CORE_GRAPHICS: &str = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
+    const CORE_FOUNDATION: &str =
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+    const LEFT_MOUSE_DOWN: u32 = 1;
+    const LEFT_MOUSE_UP: u32 = 2;
+    const LEFT_BUTTON: u32 = 0;
+    const HID_EVENT_TAP: u32 = 0;
+    /// Fraction of the display height at which to click. The centre of an
+    /// empty workspace shows the desktop; the edges do not -- the menu bar
+    /// sits at the top and an auto-hiding Dock pops up under a click at the
+    /// bottom and swallows it, which is how a bottom-corner click failed.
+    const CLICK_Y_FRACTION: f64 = 0.5;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    unsafe extern "C" {
+        fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    type WarpCursor = unsafe extern "C" fn(CGPoint) -> c_int;
+    type CreateMouseEvent = unsafe extern "C" fn(*const c_void, u32, CGPoint, u32) -> *const c_void;
+    type PostEvent = unsafe extern "C" fn(u32, *const c_void);
+    type Release = unsafe extern "C" fn(*const c_void);
+
+    struct Api {
+        warp: WarpCursor,
+        create_mouse_event: CreateMouseEvent,
+        post: PostEvent,
+        release: Release,
+    }
+
+    // Safety: immutable C function pointers into always-loaded system frameworks.
+    unsafe impl Send for Api {}
+    unsafe impl Sync for Api {}
+
+    /// Click the desktop at the centre of `frame`. Returns false when
+    /// CoreGraphics could not be bound.
+    ///
+    /// Only meaningful on a display whose active workspace is empty, where
+    /// that point shows the desktop; callers establish that first.
+    pub fn click_desktop(frame: Rect) -> bool {
+        let Some(api) = api() else {
+            return false;
+        };
+        let point = CGPoint {
+            x: frame.origin.x + frame.size.width / 2.0,
+            y: frame.origin.y + frame.size.height * CLICK_Y_FRACTION,
+        };
+        // Safety: symbols resolved from system frameworks; events are released
+        // after posting.
+        unsafe {
+            (api.warp)(point);
+            thread::sleep(Duration::from_millis(20));
+            for kind in [LEFT_MOUSE_DOWN, LEFT_MOUSE_UP] {
+                let event = (api.create_mouse_event)(std::ptr::null(), kind, point, LEFT_BUTTON);
+                if event.is_null() {
+                    return false;
+                }
+                (api.post)(HID_EVENT_TAP, event);
+                (api.release)(event);
+                thread::sleep(Duration::from_millis(15));
+            }
+        }
+        true
+    }
+
+    fn api() -> Option<&'static Api> {
+        static API: OnceLock<Option<Api>> = OnceLock::new();
+        API.get_or_init(load).as_ref()
+    }
+
+    fn load() -> Option<Api> {
+        // Safety: system framework paths; each symbol is null-checked before
+        // being transmuted to its documented signature.
+        unsafe {
+            let core_graphics = open(CORE_GRAPHICS)?;
+            let core_foundation = open(CORE_FOUNDATION)?;
+            Some(Api {
+                warp: std::mem::transmute::<*mut c_void, WarpCursor>(symbol(
+                    core_graphics,
+                    "CGWarpMouseCursorPosition",
+                )?),
+                create_mouse_event: std::mem::transmute::<*mut c_void, CreateMouseEvent>(symbol(
+                    core_graphics,
+                    "CGEventCreateMouseEvent",
+                )?),
+                post: std::mem::transmute::<*mut c_void, PostEvent>(symbol(
+                    core_graphics,
+                    "CGEventPost",
+                )?),
+                release: std::mem::transmute::<*mut c_void, Release>(symbol(
+                    core_foundation,
+                    "CFRelease",
+                )?),
+            })
+        }
+    }
+
+    unsafe fn open(path: &str) -> Option<*mut c_void> {
+        let path = CString::new(path).ok()?;
+        let handle = unsafe { dlopen(path.as_ptr(), RTLD_LAZY) };
+        (!handle.is_null()).then_some(handle)
+    }
+
+    unsafe fn symbol(handle: *mut c_void, name: &str) -> Option<*mut c_void> {
+        let name = CString::new(name).ok()?;
+        let symbol = unsafe { dlsym(handle, name.as_ptr()) };
+        (!symbol.is_null()).then_some(symbol)
+    }
+}
+
+/// Minimal binding to the private SkyLight space calls.
+pub(crate) mod skylight {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::process::Command;
     use std::ptr;
@@ -204,14 +340,37 @@ mod skylight {
     type MainConnectionId = unsafe extern "C" fn() -> c_int;
     type SetCurrentSpace = unsafe extern "C" fn(c_int, *const c_void, u64);
     type SpaceGetType = unsafe extern "C" fn(c_int, u64) -> c_int;
+    type CopySpacesForWindows = unsafe extern "C" fn(c_int, c_int, *const c_void) -> *const c_void;
     type StringCreate = unsafe extern "C" fn(*const c_void, *const c_char, u32) -> *const c_void;
+    type NumberCreate = unsafe extern "C" fn(*const c_void, c_int, *const c_void) -> *const c_void;
+    type NumberGetValue = unsafe extern "C" fn(*const c_void, c_int, *mut c_void) -> bool;
+    type ArrayCreate = unsafe extern "C" fn(
+        *const c_void,
+        *const *const c_void,
+        isize,
+        *const c_void,
+    ) -> *const c_void;
+    type ArrayGetCount = unsafe extern "C" fn(*const c_void) -> isize;
+    type ArrayGetValueAtIndex = unsafe extern "C" fn(*const c_void, isize) -> *const c_void;
     type Release = unsafe extern "C" fn(*const c_void);
+
+    /// `kCFNumberSInt32Type` and `kCFNumberSInt64Type`.
+    const CF_NUMBER_SINT32: c_int = 3;
+    const CF_NUMBER_SINT64: c_int = 4;
+    /// Every space kind: `CGSSpaceMask` all-spaces.
+    const CGS_SPACE_MASK_ALL: c_int = 0x7;
 
     struct Api {
         connection: MainConnectionId,
         set_current_space: SetCurrentSpace,
         space_get_type: SpaceGetType,
+        copy_spaces_for_windows: CopySpacesForWindows,
         string_create: StringCreate,
+        number_create: NumberCreate,
+        number_get_value: NumberGetValue,
+        array_create: ArrayCreate,
+        array_get_count: ArrayGetCount,
+        array_get_value_at_index: ArrayGetValueAtIndex,
         release: Release,
     }
 
@@ -241,6 +400,60 @@ mod skylight {
             (api.release)(cf_uuid);
         }
         true
+    }
+
+    /// The macOS spaces the WindowServer currently places window
+    /// `window_server_id` on. `None` when the private API is unavailable.
+    ///
+    /// This is the WindowServer's own answer, the same one Rift consults when
+    /// it reconciles its model against what is on screen, so it settles the
+    /// question a frame heuristic cannot: whether a display transfer has
+    /// physically happened yet.
+    pub fn window_spaces(window_server_id: u32) -> Option<Vec<u64>> {
+        let api = api()?;
+        // Safety: symbols resolved from system frameworks; every CF object
+        // created here is released before returning, and the array returned by
+        // SkyLight is owned by us per the Copy rule.
+        unsafe {
+            let id = window_server_id;
+            let number = (api.number_create)(
+                ptr::null(),
+                CF_NUMBER_SINT32,
+                ptr::from_ref(&id).cast::<c_void>(),
+            );
+            if number.is_null() {
+                return None;
+            }
+            let values = [number];
+            let ids = (api.array_create)(ptr::null(), values.as_ptr(), 1, ptr::null());
+            (api.release)(number);
+            if ids.is_null() {
+                return None;
+            }
+            let spaces = (api.copy_spaces_for_windows)((api.connection)(), CGS_SPACE_MASK_ALL, ids);
+            (api.release)(ids);
+            if spaces.is_null() {
+                return None;
+            }
+            let count = (api.array_get_count)(spaces);
+            let mut result = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+            for index in 0..count {
+                let value = (api.array_get_value_at_index)(spaces, index);
+                let mut space: i64 = 0;
+                if !value.is_null()
+                    && (api.number_get_value)(
+                        value,
+                        CF_NUMBER_SINT64,
+                        ptr::from_mut(&mut space).cast::<c_void>(),
+                    )
+                    && let Ok(space) = u64::try_from(space)
+                {
+                    result.push(space);
+                }
+            }
+            (api.release)(spaces);
+            Some(result)
+        }
     }
 
     /// Whether `space` is an ordinary Desktop rather than a fullscreen space.
@@ -287,10 +500,32 @@ mod skylight {
                     skylight,
                     "CGSSpaceGetType",
                 )?),
+                copy_spaces_for_windows: std::mem::transmute::<*mut c_void, CopySpacesForWindows>(
+                    symbol(skylight, "CGSCopySpacesForWindows")?,
+                ),
                 string_create: std::mem::transmute::<*mut c_void, StringCreate>(symbol(
                     core_foundation,
                     "CFStringCreateWithCString",
                 )?),
+                number_create: std::mem::transmute::<*mut c_void, NumberCreate>(symbol(
+                    core_foundation,
+                    "CFNumberCreate",
+                )?),
+                number_get_value: std::mem::transmute::<*mut c_void, NumberGetValue>(symbol(
+                    core_foundation,
+                    "CFNumberGetValue",
+                )?),
+                array_create: std::mem::transmute::<*mut c_void, ArrayCreate>(symbol(
+                    core_foundation,
+                    "CFArrayCreate",
+                )?),
+                array_get_count: std::mem::transmute::<*mut c_void, ArrayGetCount>(symbol(
+                    core_foundation,
+                    "CFArrayGetCount",
+                )?),
+                array_get_value_at_index: std::mem::transmute::<*mut c_void, ArrayGetValueAtIndex>(
+                    symbol(core_foundation, "CFArrayGetValueAtIndex")?,
+                ),
                 release: std::mem::transmute::<*mut c_void, Release>(symbol(
                     core_foundation,
                     "CFRelease",

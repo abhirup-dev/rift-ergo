@@ -1,3 +1,4 @@
+mod focus_follow;
 mod move_follow;
 mod move_window_to_display;
 mod move_workspace_to_display;
@@ -11,6 +12,7 @@ use rift_client::DisplayData;
 
 use crate::{Result, state_error, usage_error};
 
+pub use focus_follow::on_focus_change;
 pub use move_follow::move_follow;
 pub use move_window_to_display::move_window_to_display;
 pub use move_workspace_to_display::move_workspace_to_display;

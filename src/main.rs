@@ -1,3 +1,4 @@
+mod focus_lease;
 mod logging;
 mod policy;
 mod rift;
@@ -52,48 +53,78 @@ fn main() {
 fn run() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or_else(|| usage_error("missing command"))?;
-    match command.as_str() {
+
+    // Commands that move focus hold a lease for as long as they drive Rift, so
+    // the focus-follow hook does not answer their own focus moves with a
+    // workspace switch. `on-focus-change` manages the lease itself.
+    let holds_focus_lease = matches!(
+        command.as_str(),
+        "move-follow"
+            | "switch-workspace"
+            | "switch-workspace-both"
+            | "switch-workspace-focused"
+            | "move-window-to-display"
+            | "move-workspace-to-display"
+            | "rehome"
+    );
+    if holds_focus_lease {
+        focus_lease::renew();
+    }
+    let outcome = dispatch(&command, &mut args);
+    if holds_focus_lease {
+        focus_lease::release();
+    }
+    outcome
+}
+
+fn dispatch(command: &str, args: &mut impl Iterator<Item = String>) -> Result<()> {
+    match command {
         "move-follow" => {
             let workspace = args
                 .next()
                 .ok_or_else(|| usage_error("missing workspace"))?;
-            require_no_more_arguments(&mut args)?;
+            require_no_more_arguments(args)?;
             workflow::move_follow(&workspace)
         }
         "switch-workspace" => {
             let workspace = args
                 .next()
                 .ok_or_else(|| usage_error("missing workspace"))?;
-            require_no_more_arguments(&mut args)?;
+            require_no_more_arguments(args)?;
             workflow::switch_workspace(&workspace)
         }
         "switch-workspace-both" => {
             let workspace = args
                 .next()
                 .ok_or_else(|| usage_error("missing workspace"))?;
-            require_no_more_arguments(&mut args)?;
+            require_no_more_arguments(args)?;
             workflow::switch_workspace_both(&workspace)
         }
         "switch-workspace-focused" => {
             let workspace = args
                 .next()
                 .ok_or_else(|| usage_error("missing workspace"))?;
-            require_no_more_arguments(&mut args)?;
+            require_no_more_arguments(args)?;
             workflow::switch_workspace_focused(&workspace)
         }
         "move-window-to-display" => {
-            let direction = parse_display_direction(&mut args)?;
-            require_no_more_arguments(&mut args)?;
+            let direction = parse_display_direction(args)?;
+            require_no_more_arguments(args)?;
             workflow::move_window_to_display(direction)
         }
         "move-workspace-to-display" => {
-            let direction = parse_display_direction(&mut args)?;
-            require_no_more_arguments(&mut args)?;
+            let direction = parse_display_direction(args)?;
+            require_no_more_arguments(args)?;
             workflow::move_workspace_to_display(direction)
+        }
+        "on-focus-change" => {
+            let event = args.next();
+            require_no_more_arguments(args)?;
+            workflow::on_focus_change(event.as_deref())
         }
         "rehome" => {
             let workspace = args.next();
-            require_no_more_arguments(&mut args)?;
+            require_no_more_arguments(args)?;
             workflow::rehome(workspace.as_deref())
         }
         "-h" | "--help" | "help" => {
@@ -101,7 +132,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         "--log-path" => {
-            require_no_more_arguments(&mut args)?;
+            require_no_more_arguments(args)?;
             println!("{}", logging::describe());
             Ok(())
         }
@@ -118,6 +149,7 @@ fn print_usage() {
   rift-ergo switch-workspace-focused <workspace-name>
   rift-ergo move-window-to-display <next|prev>
   rift-ergo move-workspace-to-display <next|prev>
+  rift-ergo on-focus-change <event-json>
   rift-ergo rehome [workspace-name]\n  rift-ergo --log-path"
     );
 }
@@ -150,6 +182,7 @@ usage:
   rift-ergo switch-workspace-focused <workspace-name>
   rift-ergo move-window-to-display <next|prev>
   rift-ergo move-workspace-to-display <next|prev>
+  rift-ergo on-focus-change <event-json>
   rift-ergo rehome [workspace-name]",
             message.into()
         ),

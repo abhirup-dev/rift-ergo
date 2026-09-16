@@ -1,8 +1,13 @@
 # rift-ergo
 
 Fast ergonomic workflows for the local Rift setup. `rift-ergo` is pinned to
-the installed Rift v0.5.8.1 revision and talks directly to Rift's Mach service
+the installed Rift v0.5.5 revision and talks directly to Rift's Mach service
 through the typed `rift-client` API. It does not shell out to `rift-cli`.
+
+Rift 0.5.8.1 was tried and rolled back: it migrated windows between displays
+on its own, with no commands issued. Its client crate differs from 0.5.5 only
+by two additive protocol fields, so upgrading later is a small change here;
+the reason to wait is the daemon's behaviour, not the API.
 
 The helper is intentionally an orchestration layer, not a second window
 manager. Window moves, display transfers, workspace activation, focus, state
@@ -13,11 +18,12 @@ queries, and events all use Rift's native primitives.
 | Command | Current binding | Behavior |
 | --- | --- | --- |
 | `rift-ergo move-follow <workspace>` | `Option+Shift+X` for each configured workspace key | Move the focused window to the workspace and its policy-selected display, then follow it. |
-| `rift-ergo switch-workspace <workspace>` | `Option+X` for each configured workspace key | Activate the workspace on the display the profile assigns it to. |
+| `rift-ergo switch-workspace <workspace>` | `Option+X` for each configured workspace key | Activate the workspace on every display that holds windows of it; on the profile's display when it is empty everywhere. |
 | `rift-ergo switch-workspace-both <workspace>` | `Option+Ctrl+X` for each configured workspace key | Activate the workspace on every display, returning focus to the display it started on. |
 | `rift-ergo switch-workspace-focused <workspace>` | — (Raycast extension) | Activate the workspace on the focused display only. |
 | `rift-ergo move-window-to-display <next\|prev>` | `Option+Shift+\`` (`next`) | Move the focused window to the workspace currently active on the adjacent display, then follow it. |
 | `rift-ergo move-workspace-to-display <next\|prev>` | `Option+Shift+Tab` (`next`) | Move every window in the focused workspace to the adjacent display while preserving workspace membership and restoring focus. |
+| `rift-ergo on-focus-change <event-json>` | — (Rift `subscribe cli` hook) | Show a focused window's workspace when Rift's own auto-switch dropped it. |
 | `rift-ergo rehome [workspace]` | `Option+Shift+0` (focused workspace) | Move policy-matched windows from one selected workspace to their configured workspace and display homes. |
 
 Workspace arguments are Rift workspace names, including numeric names such as
@@ -31,15 +37,96 @@ target workspace on the configured display, transfers the exact window, uses
 the same native follow command, and verifies the final window identity and
 location.
 
+### `switch-workspace`
+
+`Option+X` is adaptive. Displays whose copy of workspace `X` holds windows all
+switch to it: both when the workspace is spread across both, one when it lives
+on one. A workspace that is empty everywhere opens on the display the profile
+assigns it. The display the keyboard is on is switched last, so focus stays
+there when it is among the targets and otherwise follows to the display that
+was switched. `switch-workspace-both` and `switch-workspace-focused` keep
+their explicit scopes.
+
 ### Display moves
 
 `move-window-to-display` targets whichever workspace is already active on the
 other display. `move-workspace-to-display` targets the same named workspace on
 the other display.
 
-A one-window workspace uses a short optimistic fast path. Multi-window moves
-use the batch workflow, restore the originally focused window, and perform
-bounded reconciliation only if Rift's resulting state is incomplete.
+`move-workspace-to-display` first shows the target workspace on the
+destination, then transfers the windows one at a time, each confirmed on the
+destination by the WindowServer before the next, restores focus to the window
+that had it, and verifies once the state is stable. Transfers are sequential
+because Rift drops a queued transfer of the focused window, and the focused
+window goes last so Rift's raise-on-transfer leaves focus where the workflow
+wants it. Bounded reconciliation runs only if a transfer landed elsewhere.
+
+### How Rift's commands are scoped
+
+Two facts about Rift shape every workflow here:
+
+- Layout commands (`SwitchToWorkspace`, `MoveWindowToWorkspace`) act on the
+  display macOS reports as active, which Rift reads from
+  `SLSCopyActiveMenuBarDisplayIdentifier`. A `MoveWindowToWorkspace` for a
+  window on any other display is silently ignored.
+- `MoveWindowToDisplay` drops the window into whatever workspace the
+  destination is showing, not the one with the same name, and it raises the
+  window there.
+
+So before a workspace can be switched or windows re-homed on a display, that
+display must be made active, and macOS only does that for a display that
+gains the key window. `placement::acquire_display` tries, in order: focus a
+window visible in the display's active workspace; focus a window Rift keeps
+hidden in the target workspace there; click the desktop, which works on the
+primary display only; focus any hidden window there and wait for Rift to
+bring its workspace forward. `move-workspace-to-display` has one more option
+when all of those fail: move the window that will end up focused first and
+focus it there. Activating Finder and `SLSSetActiveMenuBarDisplayIdentifier`
+were both tried and do nothing.
+
+Physical placement is confirmed with `CGSCopySpacesForWindows`, the
+WindowServer's own answer for which space a window is on, rather than a frame
+heuristic. Rift moves workspace membership before the window itself, and a
+window that is a member of the destination workspace while still sitting on
+the source display is exactly what Rift later "corrects" by pulling the
+membership back.
+
+### `on-focus-change`
+
+Rift auto-switches to a window's workspace only while handling an app
+activation, and only for the window the app reports as main at that moment. An
+app that moves focus to a window Rift does not manage right after activating --
+Zoom focuses an untitled helper window as it comes forward -- replaces that main
+window before Rift reads it, so the switch is dropped. The window keeps focus
+while parked offscreen in a hidden workspace, and because the app is now
+frontmost, activating it again changes nothing. Third-party switchers that raise
+a specific window, such as BetterCmdTab, hit this every time; measured 4 out of 4
+with Zoom.
+
+Rift publishes the focus event either way. `on-focus-change` is registered
+through `rift-cli subscribe cli` by
+`~/.config/rift/scripts/install-focus-follow`, runs once per focus change, and
+switches only when the focused window is one Rift manages in a workspace that is
+not showing. Everything else exits in about a millisecond without contacting
+Rift: an untracked window belongs to no workspace, and a window in the active
+workspace needs nothing. Acting costs about 20 ms.
+
+`RIFT_ERGO_FOCUS_FOLLOW=off` disables it; `=dry-run` logs the switch it would
+make without making it.
+
+#### The focus lease
+
+`placement::acquire_display` deliberately focuses windows Rift keeps hidden, so
+the workflows here generate exactly the events this hook exists to answer.
+`src/focus_lease.rs` is the shared signal: a timestamp meaning "ignore focus
+events until". Every confirmed transaction step pushes it forward, so it covers
+a workflow for as long as that workflow is driving Rift and expires on its own
+if the process dies; a longer grace after the last step covers the events Rift
+publishes while the result settles.
+
+Measured over nine cross-display `switch-workspace-both` runs: the hook would
+have fired 8 and 10 times in two unleased runs, and fired 0 times with the lease,
+with no change in workflow failures.
 
 ### `rehome`
 
@@ -100,6 +187,7 @@ rift-ergo/
 └── src/
     ├── main.rs                CLI parsing and command dispatch
     ├── policy.rs              Monitor profiles and window-home matching
+    ├── focus_lease.rs         Suppression shared with the focus-follow hook
     ├── rift.rs                Typed Rift queries and command constructors
     ├── transaction.rs         Event/state confirmation with bounded deadlines
     └── workflow/
@@ -107,6 +195,7 @@ rift-ergo/
         ├── placement.rs       Shared target preparation and follow mechanics
         ├── move_follow.rs
         ├── move_window_to_display.rs
+        ├── focus_follow.rs
         ├── move_workspace_to_display.rs
         └── rehome.rs
 ```
@@ -123,23 +212,6 @@ cooperative rather than a hard wall-clock deadline.
 Physical placement checks are display-topology and layout aware. Workspace
 membership is the conservative fallback when scrolling geometry cannot safely
 distinguish a display.
-
-## Visual layout order
-
-`move-workspace-to-display` restores the source workspace's tiled order on the
-destination. The order is captured from the container tree before the transfer
-and replayed afterwards as a permutation, using Rift's typed `SwapWindows`
-primitive in at most `n - 1` commands. Only the moved windows participate, so
-windows already living in the destination workspace are left untouched.
-
-This became practical in Rift 0.5.8.1, which gives container tree nodes stable
-`node_id`s and target frames.
-
-To disable it, create `~/.config/rift/rift-ergo.no-restore-order`; delete the
-file to re-enable. Rift runs bindings as an argv array with no shell, so
-`RIFT_ERGO_RESTORE_ORDER=0` is only usable when invoking the binary by hand.
-Restoration never fails the move: membership and focus are confirmed first, and
-a reordering failure is logged rather than propagated.
 
 ## Logging
 

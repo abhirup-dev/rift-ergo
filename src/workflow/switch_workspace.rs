@@ -8,19 +8,46 @@ use crate::transaction::RiftTransaction;
 
 use super::placement;
 
-/// Activate `workspace_name` on the display the monitor profile assigns it to,
-/// replacing scripts/switch-workspace-smart.
+/// Show `workspace_name` where its windows are, replacing
+/// scripts/switch-workspace-smart.
 ///
-/// This is `prepare_target` with the profile lookup in front of it: focus the
-/// destination display, then activate the workspace there. Going through
-/// rift-ergo rather than the script means workspace switching shares the
-/// transaction's event-confirmed waits and the unmanaged-space recovery in
-/// `space_escape`.
+/// Every display that holds windows of the workspace switches to it: both
+/// when the workspace is spread across both, one when it lives on one. Only a
+/// workspace with no windows anywhere falls back to the display the monitor
+/// profile assigns it, so an empty workspace still opens somewhere sensible.
+///
+/// Displays are switched with the one the keyboard is on last, so focus ends
+/// there when it is among them; otherwise focus follows to the display that
+/// was switched. Each per-display step shares the transaction's
+/// event-confirmed waits and the unmanaged-space recovery in `space_escape`.
 pub fn switch_workspace(workspace_name: &str) -> Result<()> {
     let rift = Rift::connect()?;
-    let displays = rift.displays()?;
-    let target_display = policy::target_display(workspace_name, &displays)?;
-    activate_on_display(&rift, workspace_name, &target_display, displays)?;
+    let mut displays = rift.displays()?;
+
+    let origin = displays
+        .iter()
+        .find(|display| display.is_active_context)
+        .map(|display| display.uuid.clone());
+
+    let mut targets: Vec<String> = rift
+        .workspace_on_each_display(workspace_name, &displays)?
+        .into_iter()
+        .filter(|(_, workspace)| !workspace.windows.is_empty())
+        .map(|(display, _)| display.uuid)
+        .collect();
+    if targets.is_empty() {
+        targets.push(policy::target_display(workspace_name, &displays)?);
+    }
+    if let Some(origin) = &origin
+        && let Some(position) = targets.iter().position(|uuid| uuid == origin)
+    {
+        let origin = targets.remove(position);
+        targets.push(origin);
+    }
+
+    for uuid in &targets {
+        displays = activate_on_display(&rift, workspace_name, uuid, displays)?;
+    }
     Ok(())
 }
 
@@ -35,7 +62,8 @@ pub(super) fn activate_on_display(
     display_uuid: &str,
     displays: Vec<DisplayData>,
 ) -> Result<Vec<DisplayData>> {
-    let displays = space_escape::ensure_managed_space(rift, display_uuid, displays)?;
+    let displays =
+        space_escape::ensure_managed_space(rift, display_uuid, displays, Some(workspace_name))?;
     let target = rift.target_context(workspace_name, display_uuid.to_owned(), &displays)?;
 
     // Rift's auto-back-and-forth is disabled in config, but re-issuing a switch
@@ -43,11 +71,6 @@ pub(super) fn activate_on_display(
     if target.display_is_active && target.workspace_is_active {
         return Ok(displays);
     }
-
-    // Nothing is being moved here, so an empty destination workspace leaves
-    // prepare_target without a focus anchor. Acquire the display first; if the
-    // display is already active this is a no-op.
-    space_escape::focus_display(rift, &target.display_uuid, target.space)?;
 
     let transaction = RiftTransaction::new(rift)?;
     placement::prepare_target(rift, &transaction, &target, workspace_name)?;
