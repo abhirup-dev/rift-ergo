@@ -422,7 +422,13 @@ fn event_workspace(event: &RiftEvent) -> Option<&str> {
         | RiftEvent::WindowsChanged { workspace_name, .. }
         | RiftEvent::FocusedWindowChanged { workspace_name, .. }
         | RiftEvent::LayoutChanged { workspace_name, .. } => Some(workspace_name),
-        RiftEvent::WindowTitleChanged { .. } | RiftEvent::StacksChanged { .. } => None,
+        // Not transitions: a title, a stack redraw, and a selection move within
+        // a layout all leave workspace membership and display placement alone,
+        // so waiting on them would wake a step before its state changed. The
+        // match stays exhaustive so a new Rift event forces this decision.
+        RiftEvent::WindowTitleChanged { .. }
+        | RiftEvent::StacksChanged { .. }
+        | RiftEvent::SelectionChanged { .. } => None,
     }
 }
 

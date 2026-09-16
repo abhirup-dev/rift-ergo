@@ -23,6 +23,7 @@ use super::placement;
 const SEEN_PATH: &str = "/tmp/rift-new-window-seen.json";
 const READY_PATH: &str = "/tmp/rift-new-window-ready";
 const LOCK_PATH: &str = "/tmp/rift-new-window.lock";
+const LAUNCHD_LABEL: &str = "sh.brew.rift";
 const CLEANUP_SCRIPT: &str = "/Users/abhirupdas/.config/rift/scripts/cleanup-stale-layout-windows";
 
 /// Rift reports a window before its frame and workspace have settled.
@@ -278,14 +279,32 @@ fn rift_is_ready() -> bool {
     }
 }
 
-/// Rift's pid, read from the process table.
+/// The pid of the Rift the baseline was recorded against.
 ///
-/// Not `pgrep`: Rift spawns this hook in a context where `pgrep -x rift`, and
-/// even a bare `pgrep rift`, return nothing while `ps` lists the daemon
-/// perfectly. The Python reconciler this replaces used `pgrep` for the same
-/// check, so its readiness guard never passed -- it has no log file at all,
-/// meaning it has not placed a window in a very long time.
+/// Read from launchd rather than the process table. `pgrep` returns nothing in
+/// the environment Rift spawns hooks in -- the Python reconciler this replaces
+/// used `pgrep` for the same check, so its guard never passed and it never
+/// placed a window. Matching a process *name* instead only moved the problem:
+/// the binary is not always called `rift`, and a renamed build silently
+/// disabled the hook again. The launchd label is the one identifier that does
+/// not change when the binary does.
 fn rift_pid() -> Option<String> {
+    let output = Command::new("/bin/launchctl")
+        .args(["list", LAUNCHD_LABEL])
+        .output()
+        .ok()?;
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let pid = listing
+        .lines()
+        .find_map(|line| line.split_once("\"PID\" ="))
+        .map(|(_, rest)| rest.trim().trim_end_matches(';').trim())
+        .filter(|pid| !pid.is_empty())
+        .map(str::to_string);
+    pid.or_else(rift_pid_from_process_table)
+}
+
+/// Fallback for a Rift started by hand rather than by launchd.
+fn rift_pid_from_process_table() -> Option<String> {
     let output = Command::new("/bin/ps")
         .args(["-Ao", "pid=,comm="])
         .output()

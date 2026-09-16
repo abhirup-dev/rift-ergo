@@ -399,6 +399,19 @@ impl Rift {
         RiftCommand::Layout(LayoutCommand::SwitchToWorkspace(target.workspace_index))
     }
 
+    /// Move the active workspace of the *active* display to `target`.
+    ///
+    /// The command carries no source: Rift reads it from whichever display is
+    /// active when the command runs. Binding that display first is the caller's
+    /// job. The destination is addressed by UUID rather than by direction so
+    /// Rift's notion of "next display" cannot disagree with ours.
+    pub fn move_workspace_to_display_command(&self, target: &TargetContext) -> RiftCommand {
+        RiftCommand::Reactor(ReactorCommand::MoveWorkspaceToDisplay {
+            selector: DisplaySelector::Uuid(target.display_uuid.clone()),
+            wrap_around: false,
+        })
+    }
+
     pub fn transfer_window_command(
         &self,
         target: &TargetContext,

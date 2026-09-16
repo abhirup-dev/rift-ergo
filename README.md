@@ -54,18 +54,49 @@ their explicit scopes.
 other display. `move-workspace-to-display` targets the same named workspace on
 the other display.
 
-`move-workspace-to-display` first shows the target workspace on the
-destination, then transfers the windows one at a time, each confirmed on the
-destination by the WindowServer before the next, restores focus to the window
-that had it, and verifies once the state is stable. Transfers are sequential
-because Rift drops a queued transfer of the focused window, and the focused
-window goes last so Rift's raise-on-transfer leaves focus where the workflow
-wants it. Bounded reconciliation runs only if a transfer landed elsewhere.
+`move-workspace-to-display` hands the relocation to Rift's own
+`MoveWorkspaceToDisplay`, which moves the layout tree of the source display's
+active workspace into the destination's workspace at the same ordinal, shows it
+there, and raises the windows. Measured over 44 moves: a median of about 900 ms
+and 43 clean, against 3832 ms for the per-window transfer loop it replaced. The
+destination's other workspaces are untouched -- only the windows of the source
+workspace move, and the workspace that was showing on the destination simply
+stops showing.
+
+What remains around that one command is everything it does not do:
+
+- **Choosing the source.** The command carries no source; Rift reads it from
+  whichever display is active when the command runs. So the source has to be
+  bound first, and it has to be bound *after* every step that moves focus.
+- **Showing the source workspace.** Rift moves the workspace that is on screen,
+  not the one holding the key window. Focusing a window does not show its
+  workspace, so that is an explicit step.
+- **Escaping fullscreen on both displays.** Source and destination are both
+  filtered by "is this space active", so a native-fullscreen space on either end
+  makes the command a silent no-op.
+- **Noticing that nothing happened.** Rift declines the command on eight
+  separate paths -- a drag in progress, either space unavailable, source and
+  destination resolving to the same space, an empty workspace, a layout engine
+  with nothing to relocate -- and every one of them logs to Rift's own log and
+  returns a successful IPC send. Only the state check separates a move from a
+  no-op.
+- **Restoring focus.** Rift picks the destination's focus by its own preference,
+  which is not necessarily the window that had it.
+- **Finishing a partial move.** Once in 44 moves the command left a window
+  behind. A bounded repair pass moves the stragglers individually, using the
+  same confirmed transfer that `move-window-to-display` uses. It sits inside the
+  move step's timeout branch, so a successful move never reaches it: over 20
+  controlled moves it engaged zero times. The cost is paid only when the
+  alternative is a workspace split across two displays.
+
+`RIFT_ERGO_NATIVE_WORKSPACE_MOVE=off` falls back to the previous
+transfer-and-reconcile implementation, kept in `move_workspace_legacy.rs` until
+the native path has enough live use behind it.
 
 ### Which workspace a command starts from
 
 The source workspace follows the **key window**, not the display macOS reports
-as active. The two disagree often enough to matter: focus and the active-menu-bar
+as active, and the command refuses when the two cannot be reconciled. The two disagree often enough to matter: focus and the active-menu-bar
 display are updated by separate asynchronous paths, and a workspace move issued
 in the gap between them runs on the wrong display. Two of three early
 `move-workspace-to-display` runs went the wrong way for exactly this reason. A
@@ -73,6 +104,18 @@ three-way probe showed the APIs themselves agree 24 out of 24 times within
 150 ms, so the disagreement is not a stale read -- something moved focus between
 the check and the command. Reading the key window instead makes the source the
 window the user is actually looking at.
+
+Focus is also not durable. Alternating hard focus across displays twelve times,
+all three views agreed 24 out of 24 at both 250 ms and 1.25 s -- but on two of
+the six moves to the builtin, focus had been taken back by another application
+within 1.25 s. Within a single display, 24 of 24 held. So the source is re-read
+immediately before the command is sent, not once at the start.
+
+There is one state that neither signal resolves: the key window in a workspace
+that is not the one on screen. `on-focus-change` normally closes that gap by
+showing the key window's workspace, but when it persists the two answers name
+different workspaces and nothing can tell which the keypress meant. The move
+refuses and says so, rather than relocating the wrong one.
 
 ### How Rift's commands are scoped
 
@@ -165,11 +208,14 @@ runs `on-windows-changed --init` at startup to record every existing window as
 already placed, so a Rift restart re-derives nothing; events arriving before that
 baseline lands are ignored, because they would treat the whole desktop as new.
 
-Readiness is checked by reading the process table directly rather than with
-`pgrep`. In the environment Rift spawns hooks in, `pgrep -x rift` and even a bare
-`pgrep rift` return nothing while `ps` lists the daemon. The Python reconciler
-this replaces used `pgrep` for the same check, so its guard never passed and it
-never placed a window.
+Readiness is checked against the pid launchd reports for `sh.brew.rift`. Two
+earlier attempts were both silently wrong: `pgrep -x rift`, and even a bare
+`pgrep rift`, return nothing in the environment Rift spawns hooks in -- the
+Python reconciler this replaces used `pgrep` for the same check, so its guard
+never passed and it never placed a window. Matching a process *name* instead only
+moved the problem, because the binary is not always called `rift` and a renamed
+build disabled the hook again without a word. The launchd label is the one
+identifier that does not change when the binary does.
 
 `RIFT_ERGO_NEW_WINDOW=off` disables it; `=dry-run` logs the placements it would
 make. `RIFT_ERGO_NEW_WINDOW_STATE` points the placed set elsewhere, which is how
@@ -270,6 +316,7 @@ rift-ergo/
         ├── focus_follow.rs
         ├── new_window.rs
         ├── move_workspace_to_display.rs
+        ├── move_workspace_legacy.rs
         └── rehome.rs
 ```
 

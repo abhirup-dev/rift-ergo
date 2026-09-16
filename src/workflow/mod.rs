@@ -1,6 +1,7 @@
 mod focus_follow;
 mod move_follow;
 mod move_window_to_display;
+mod move_workspace_legacy;
 mod move_workspace_to_display;
 mod new_window;
 mod placement;
