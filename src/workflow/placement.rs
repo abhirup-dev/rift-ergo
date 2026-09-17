@@ -26,7 +26,14 @@ pub(super) fn follow_window(
     workspace_name: &str,
     focused: FocusedWindow,
 ) -> Result<()> {
-    if focused.location.display_uuid == target.display_uuid {
+    // The single shared point where one window changes place, so every command
+    // that moves one window reports in the same words.
+    let description = format!(
+        "{} to workspace {workspace_name} on {}",
+        focused.window.app_name.as_deref().unwrap_or("window"),
+        target.display_name()
+    );
+    let result = if focused.location.display_uuid == target.display_uuid {
         move_within_display(rift, transaction, &target, workspace_name, &focused.window)
     } else {
         CrossDisplayWorkflow {
@@ -37,7 +44,11 @@ pub(super) fn follow_window(
             window: focused.window,
         }
         .run()
+    };
+    if result.is_ok() {
+        crate::notify::moved(description);
     }
+    result
 }
 
 pub(super) fn already_at_target(

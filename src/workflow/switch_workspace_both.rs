@@ -33,6 +33,7 @@ pub fn switch_workspace_both(workspace_name: &str) -> Result<()> {
     for uuid in &uuids {
         displays = activate_on_display(&rift, workspace_name, uuid, displays)?;
     }
+    crate::notify::switched(format!("workspace {workspace_name} on every display"));
 
     let Some(origin) = origin else {
         return Ok(());

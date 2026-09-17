@@ -27,18 +27,19 @@ fn main() {
         Ok(()) => {
             let elapsed = started.elapsed().as_millis();
             logging::info(&format!("ok [{}] in {} ms", invocation.join(" "), elapsed));
-            if let Some(summary) = notify::summary() {
-                notify::notify(
-                    notify::Outcome::Moved,
+            // One report, one notification. A workflow that refused reports it
+            // and returns Ok, so the refusal is announced exactly once.
+            match notify::report() {
+                Some(report) => notify::notify(
+                    report.outcome,
                     &format!("rift-ergo: {command}"),
-                    &format!("{summary} ({elapsed} ms)"),
-                );
-            } else {
-                notify::notify(
+                    &format!("{} ({elapsed} ms)", report.message),
+                ),
+                None => notify::notify(
                     notify::Outcome::Quiet,
                     &format!("rift-ergo: {command}"),
                     &format!("done in {elapsed} ms"),
-                );
+                ),
             }
         }
         Err(error) => {
@@ -86,6 +87,7 @@ fn run() -> Result<()> {
             | "move-workspace-to-display"
             | "rehome"
             | "on-windows-changed"
+            | "prune-layout"
     );
     if holds_focus_lease {
         focus_lease::renew();
@@ -136,6 +138,10 @@ fn dispatch(command: &str, args: &mut impl Iterator<Item = String>) -> Result<()
             let direction = parse_display_direction(args)?;
             require_no_more_arguments(args)?;
             workflow::move_workspace_to_display(direction)
+        }
+        "prune-layout" => {
+            require_no_more_arguments(args)?;
+            workflow::prune_layout()
         }
         "on-windows-changed" => {
             let first = args.next();

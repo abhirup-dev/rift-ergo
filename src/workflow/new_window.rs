@@ -24,7 +24,6 @@ const SEEN_PATH: &str = "/tmp/rift-new-window-seen.json";
 const READY_PATH: &str = "/tmp/rift-new-window-ready";
 const LOCK_PATH: &str = "/tmp/rift-new-window.lock";
 const LAUNCHD_LABEL: &str = "sh.brew.rift";
-const CLEANUP_SCRIPT: &str = "/Users/abhirupdas/.config/rift/scripts/cleanup-stale-layout-windows";
 
 /// Rift reports a window before its frame and workspace have settled.
 const SETTLE: Duration = Duration::from_millis(200);
@@ -136,13 +135,20 @@ pub fn on_windows_changed(event_json: Option<&str>) -> Result<()> {
         save_seen(&seen);
     }
     if placed > 0 {
-        notify::summarize(format!(
+        notify::moved(format!(
             "placed {placed} new window{}",
             if placed == 1 { "" } else { "s" }
         ));
     }
-    if event_json.is_some() {
-        let _ = Command::new(CLEANUP_SCRIPT).status();
+    // A destroyed window can leave its layout node behind, and nothing in Rift
+    // ever re-checks. There is no event for it, so this rides along on window
+    // activity that does fire. Its failures are reported rather than swallowed:
+    // the shell script this replaces hid a wrong CLI argument behind a bare
+    // `except Exception` and silently did nothing for months.
+    if event_json.is_some()
+        && let Err(error) = super::prune_layout::prune_layout()
+    {
+        logging::warn(&format!("new-window: prune failed: {error}"));
     }
     Ok(())
 }

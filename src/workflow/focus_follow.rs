@@ -97,6 +97,7 @@ pub fn on_focus_change(event_json: Option<&str>) -> Result<()> {
     let outcome = activate_on_display(&rift, &home.name, &display_uuid, rift.displays()?);
     focus_lease::release();
     outcome?;
+    crate::notify::switched(format!("followed focus to workspace {}", home.name));
     Ok(())
 }
 

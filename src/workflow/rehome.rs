@@ -27,20 +27,33 @@ pub fn rehome(workspace_name: Option<&str>) -> Result<()> {
     let routed = policy.route_windows(&source.windows)?;
 
     if routed.is_empty() {
+        crate::notify::refused("no window here matches the routing policy");
         return Ok(());
     }
 
     let groups = group_by_destination(routed);
     if groups_are_at_home(&rift, &groups)? {
+        crate::notify::switched("every matched window is already home");
         return Ok(());
     }
 
+    let moved = groups
+        .iter()
+        .map(|group| group.windows.len())
+        .sum::<usize>();
     let transaction = RiftTransaction::for_batch(&rift, source.windows.len())?;
     for group in &groups {
         place_group(&rift, &transaction, group)?;
     }
     restore_source(&rift, &transaction, &source)?;
-    verify_groups(&rift, &groups)
+    verify_groups(&rift, &groups)?;
+    crate::notify::moved(format!(
+        "{moved} window{} to {} home{}",
+        if moved == 1 { "" } else { "s" },
+        groups.len(),
+        if groups.len() == 1 { "" } else { "s" }
+    ));
+    Ok(())
 }
 
 fn select_source(

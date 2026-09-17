@@ -19,5 +19,6 @@ pub fn switch_workspace_focused(workspace_name: &str) -> Result<()> {
         .map(|display| display.uuid.clone())
         .ok_or_else(|| state_error("no display is Rift's active context"))?;
     activate_on_display(&rift, workspace_name, &focused, displays)?;
+    crate::notify::switched(format!("workspace {workspace_name} on the focused display"));
     Ok(())
 }

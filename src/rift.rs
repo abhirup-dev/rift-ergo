@@ -1,6 +1,7 @@
 use rift_client::{
-    DisplayData, DisplaySelector, EventKind, LayoutCommand, ReactorCommand, Rect, RiftCommand,
-    RiftMachClient, RiftMachSubscription, WindowData, WindowId, WorkspaceData, WorkspaceSelector,
+    DisplayData, DisplaySelector, EventKind, LayoutCommand, LayoutStateData, ReactorCommand, Rect,
+    RiftCommand, RiftMachClient, RiftMachSubscription, WindowData, WindowId, WorkspaceData,
+    WorkspaceSelector,
 };
 
 use crate::{Result, state_error};
@@ -311,6 +312,17 @@ impl Rift {
         self.client.get_window_info(window_id).ok()
     }
 
+    /// The layout engine's own view of one workspace, including `tiled_windows`.
+    ///
+    /// This is the only place a window destroyed without Rift noticing is still
+    /// visible: it is gone from `workspaces` and from `window_info`, but its
+    /// node survives here and keeps reserving space.
+    pub fn layout_state(&self, space: u64, workspace_index: usize) -> Result<LayoutStateData> {
+        Ok(self
+            .client
+            .get_workspace_layout_state(Some(space), Some(workspace_index))?)
+    }
+
     /// Every window Rift manages, with where it currently lives.
     pub fn window_locations(
         &self,
@@ -420,6 +432,29 @@ impl Rift {
         RiftCommand::Reactor(ReactorCommand::MoveWindowToDisplay {
             selector: DisplaySelector::Uuid(target.display_uuid.clone()),
             window_id: Some(window.id.idx),
+        })
+    }
+
+    pub fn focus_display_command(&self, display_uuid: &str) -> RiftCommand {
+        RiftCommand::Reactor(ReactorCommand::FocusDisplay(DisplaySelector::Uuid(
+            display_uuid.to_string(),
+        )))
+    }
+
+    /// Move a layout node by window id alone.
+    ///
+    /// Unlike `move_window_to_workspace_command` this takes no `WindowData`,
+    /// because the window it addresses no longer exists -- only the layout node
+    /// does, and the id in that node is all there is to name it by.
+    pub fn move_stale_window_command(
+        &self,
+        workspace_index: usize,
+        window_id: WindowId,
+    ) -> RiftCommand {
+        RiftCommand::Layout(LayoutCommand::MoveWindowToWorkspace {
+            workspace: WorkspaceSelector::Index(workspace_index),
+            follow: false,
+            window_id: Some(window_id.idx),
         })
     }
 

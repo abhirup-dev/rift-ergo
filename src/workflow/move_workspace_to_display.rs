@@ -50,11 +50,7 @@ pub fn move_workspace_to_display(direction: DisplayDirection) -> Result<()> {
         crate::logging::info(&format!(
             "workspace {workspace_name} has no windows; nothing to move"
         ));
-        notify::notify(
-            notify::Outcome::Failed,
-            "rift-ergo: nothing to move",
-            &format!("workspace {workspace_name} has no windows"),
-        );
+        notify::refused(format!("workspace {workspace_name} has no windows"));
         return Ok(());
     };
 
@@ -154,7 +150,7 @@ pub fn move_workspace_to_display(direction: DisplayDirection) -> Result<()> {
     )?;
     verify(&rift, &target, &workspace_name, &window_ids)?;
 
-    notify::summarize(format!(
+    notify::moved(format!(
         "{} window{} to workspace {} on {}",
         window_ids.len(),
         if window_ids.len() == 1 { "" } else { "s" },
@@ -260,7 +256,7 @@ fn confirm_source(rift: &Rift, source: &TargetContext, workspace_name: &str) -> 
             source.display_name()
         );
         crate::logging::warn(&message);
-        notify::notify(notify::Outcome::Failed, "rift-ergo: move aborted", &message);
+        notify::refused(&message);
         return Err(state_error(message));
     }
     // Both halves matter and they are not the same question. The first is "am I
@@ -280,7 +276,7 @@ fn confirm_source(rift: &Rift, source: &TargetContext, workspace_name: &str) -> 
         workspace_name
     );
     crate::logging::warn(&message);
-    notify::notify(notify::Outcome::Failed, "rift-ergo: move aborted", &message);
+    notify::refused(&message);
     Err(state_error(message))
 }
 

@@ -23,9 +23,18 @@ use std::sync::Mutex;
 
 const TERMINAL_NOTIFIER: &str = "/opt/homebrew/bin/terminal-notifier";
 
-/// Set by a workflow that wants the notification to say what it did, rather
-/// than repeating the command line.
-static SUMMARY: Mutex<Option<String>> = Mutex::new(None);
+/// What the workflow did, set through the `report` helpers below.
+///
+/// One invocation produces at most one report and at most one notification.
+/// Workflows never call `notify` themselves: a workflow that both notified and
+/// returned an error produced two notifications for one keypress.
+static REPORT: Mutex<Option<Report>> = Mutex::new(None);
+
+#[derive(Clone)]
+pub struct Report {
+    pub outcome: Outcome,
+    pub message: String,
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Outcome {
@@ -64,16 +73,35 @@ impl Mode {
     }
 }
 
-/// Record what this invocation actually did, for the notification body.
-pub fn summarize(summary: impl Into<String>) {
-    if let Ok(mut slot) = SUMMARY.lock() {
-        *slot = Some(summary.into());
+fn record(outcome: Outcome, message: impl Into<String>) {
+    if let Ok(mut slot) = REPORT.lock() {
+        *slot = Some(Report {
+            outcome,
+            message: message.into(),
+        });
     }
 }
 
-/// Whatever `summarize` last recorded.
-pub fn summary() -> Option<String> {
-    SUMMARY.lock().ok().and_then(|slot| slot.clone())
+/// Windows were relocated. The message says what went where.
+pub fn moved(message: impl Into<String>) {
+    record(Outcome::Moved, message);
+}
+
+/// Something visible changed without relocating a window: a workspace switch,
+/// a focus follow. Self-evident on screen, so silent unless `all`.
+pub fn switched(message: impl Into<String>) {
+    record(Outcome::Quiet, message);
+}
+
+/// The workflow declined to act on purpose. Worth interrupting for, because
+/// the keypress looked like it did nothing.
+pub fn refused(message: impl Into<String>) {
+    record(Outcome::Failed, message);
+}
+
+/// Whatever this invocation last reported.
+pub fn report() -> Option<Report> {
+    REPORT.lock().ok().and_then(|slot| slot.clone())
 }
 
 pub fn notify(outcome: Outcome, title: &str, message: &str) {

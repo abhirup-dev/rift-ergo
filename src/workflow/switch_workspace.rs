@@ -48,6 +48,11 @@ pub fn switch_workspace(workspace_name: &str) -> Result<()> {
     for uuid in &targets {
         displays = activate_on_display(&rift, workspace_name, uuid, displays)?;
     }
+    crate::notify::switched(format!(
+        "workspace {workspace_name} on {} display{}",
+        targets.len(),
+        if targets.len() == 1 { "" } else { "s" }
+    ));
     Ok(())
 }
 
