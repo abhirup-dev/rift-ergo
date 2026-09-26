@@ -1,13 +1,15 @@
 # rift-ergo
 
 Fast ergonomic workflows for the local Rift setup. `rift-ergo` is pinned to
-the installed Rift v0.5.5 revision and talks directly to Rift's Mach service
-through the typed `rift-client` API. It does not shell out to `rift-cli`.
+Rift v0.5.10 and talks directly to Rift's Mach service through the typed
+`rift-client` API. It does not shell out to `rift-cli`.
 
-Rift 0.5.8.1 was tried and rolled back: it migrated windows between displays
-on its own, with no commands issued. Its client crate differs from 0.5.5 only
-by two additive protocol fields, so upgrading later is a small change here;
-the reason to wait is the daemon's behaviour, not the API.
+Rift 0.5.8.1 was previously tried and rolled back: it migrated windows between
+displays on its own, with no commands issued. The later local installation used
+revision `072411b` (just before v0.5.9); v0.5.10 adds display-scoped queries and
+fixes focus-stealing during display churn and app-rule rediscovery. The earlier
+uncommanded migration has not reproduced on v0.5.10 in daily use since
+2026-09-23.
 
 The helper is intentionally an orchestration layer, not a second window
 manager. Window moves, display transfers, workspace activation, focus, state
