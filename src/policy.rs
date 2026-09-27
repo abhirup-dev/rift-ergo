@@ -20,6 +20,9 @@ struct Policy {
 struct DisplayAlias {
     uuid: Option<String>,
     name: Option<String>,
+    /// Interchangeable monitors that fill the same role, e.g. one per desk.
+    #[serde(default)]
+    names: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +168,10 @@ fn resolve_display_aliases(policy: &Policy, displays: &[DisplayData]) -> HashMap
                 .find(|display| {
                     configured.uuid.as_deref() == Some(display.uuid.as_str())
                         || configured.name.as_deref() == display.name.as_deref()
+                        || configured
+                            .names
+                            .iter()
+                            .any(|name| display.name.as_deref() == Some(name.as_str()))
                 })
                 .map(|display| (alias.clone(), display.uuid.clone()))
         })
@@ -319,6 +326,24 @@ mod tests {
     }
 
     #[test]
+    fn alias_matches_any_listed_display_name() {
+        let policy = Policy {
+            display_aliases: HashMap::from([(
+                "external".into(),
+                DisplayAlias {
+                    uuid: None,
+                    name: None,
+                    names: vec!["LS27D80xU".into(), "D27-40".into()],
+                },
+            )]),
+            profiles: Vec::new(),
+        };
+        let aliases = resolve_display_aliases(&policy, &[display("d27", "D27-40")]);
+        assert_eq!(aliases.get("external").map(String::as_str), Some("d27"));
+        assert!(resolve_display_aliases(&policy, &[display("x", "Other")]).is_empty());
+    }
+
+    #[test]
     fn selects_first_profile_with_available_aliases() {
         let policy = Policy {
             display_aliases: HashMap::from([
@@ -327,6 +352,7 @@ mod tests {
                     DisplayAlias {
                         uuid: Some("built".into()),
                         name: None,
+                        names: Vec::new(),
                     },
                 ),
                 (
@@ -334,6 +360,7 @@ mod tests {
                     DisplayAlias {
                         uuid: Some("ext".into()),
                         name: None,
+                        names: Vec::new(),
                     },
                 ),
             ]),
