@@ -190,6 +190,39 @@ impl<'a> RiftTransaction<'a> {
         )
     }
 
+    /// A native action outside Rift's IPC, confirmed by the same Crossbeam
+    /// subscription and state/deadline loop as an ordinary transaction step.
+    /// Renew the focus lease and drain old events before acting. `false` means
+    /// the action was unavailable; a posted action still has to be confirmed.
+    pub fn external_step<Action, StateCheck>(
+        &self,
+        description: &str,
+        expectation: EventExpectation<'_>,
+        action: Action,
+        state_matches: StateCheck,
+        timeout: Duration,
+    ) -> Result<bool>
+    where
+        Action: FnOnce() -> bool,
+        StateCheck: FnMut(&Rift) -> Result<bool>,
+    {
+        self.ensure_budget(description)?;
+        self.drain_pending_events()?;
+        let started = Instant::now();
+        if !action() {
+            return Ok(false);
+        }
+        self.wait_for_state(
+            description,
+            expectation,
+            state_matches,
+            started,
+            timeout,
+            false,
+        )?;
+        Ok(true)
+    }
+
     /// Wait for state already set in motion outside this transaction -- an
     /// application activation, a space switch -- without issuing a command.
     pub fn await_state<StateCheck>(
@@ -281,6 +314,7 @@ impl<'a> RiftTransaction<'a> {
     {
         let deadline = self.deadline(started, timeout);
         let mut matching_event_seen = false;
+        let mut last_probe = started;
 
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -288,16 +322,21 @@ impl<'a> RiftTransaction<'a> {
             match self.events.recv_timeout(wait) {
                 Ok(EventMessage::Event(event)) if expectation.matches(&event) => {
                     matching_event_seen = true;
+                    last_probe = Instant::now();
                     if state_matches(self.rift)? {
                         trace_wait(description, "matching event", started.elapsed());
                         return Ok(());
                     }
                 }
-                Ok(EventMessage::Event(_)) => {}
+                Ok(EventMessage::Event(_)) if last_probe.elapsed() < STATE_PROBE_INTERVAL => {}
                 Ok(EventMessage::Error(error)) => {
                     return Err(state_error(format!("event subscription failed: {error}")));
                 }
-                Err(RecvTimeoutError::Timeout) => {
+                // Unrelated events still probe once the interval is up: an
+                // activation floods the stream, which otherwise starves the
+                // probe until the deadline.
+                Ok(EventMessage::Event(_)) | Err(RecvTimeoutError::Timeout) => {
+                    last_probe = Instant::now();
                     let event_requirement_satisfied = !require_matching_event
                         || matching_event_seen
                         || started.elapsed() >= EVENT_GRACE_PERIOD;
@@ -423,12 +462,15 @@ fn event_workspace(event: &RiftEvent) -> Option<&str> {
         | RiftEvent::FocusedWindowChanged { workspace_name, .. }
         | RiftEvent::LayoutChanged { workspace_name, .. } => Some(workspace_name),
         // Not transitions: a title, a stack redraw, and a selection move within
-        // a layout all leave workspace membership and display placement alone,
+        // a layout, a binding mode switch, and a config revision all leave
+        // workspace membership and display placement alone,
         // so waiting on them would wake a step before its state changed. The
         // match stays exhaustive so a new Rift event forces this decision.
         RiftEvent::WindowTitleChanged { .. }
         | RiftEvent::StacksChanged { .. }
-        | RiftEvent::SelectionChanged { .. } => None,
+        | RiftEvent::SelectionChanged { .. }
+        | RiftEvent::BindingModeChanged { .. }
+        | RiftEvent::ConfigChanged { .. } => None,
     }
 }
 
@@ -453,6 +495,70 @@ fn trace_wait(description: &str, completion: &str, elapsed: Duration) {
 mod tests {
     use super::*;
     use rift_client::{WindowId, WorkspaceId};
+
+    #[test]
+    #[ignore = "read-only Crossbeam/native-step integration check; requires running Rift"]
+    fn external_step_requires_state_confirmation() {
+        let rift = Rift::connect().unwrap();
+        let transaction = RiftTransaction::new(&rift).unwrap();
+        let expectation = EventExpectation::Display("no-matching-event-required");
+        assert!(
+            !transaction
+                .external_step(
+                    "unavailable native test action",
+                    expectation,
+                    || false,
+                    |_| panic!("an unavailable action must not wait"),
+                    Duration::from_millis(100),
+                )
+                .unwrap()
+        );
+        let mut probed = false;
+        assert!(
+            transaction
+                .external_step(
+                    "confirmed native test action",
+                    expectation,
+                    || true,
+                    |_| {
+                        probed = true;
+                        Ok(true)
+                    },
+                    Duration::from_millis(100),
+                )
+                .unwrap()
+        );
+        assert!(probed);
+        let error = transaction
+            .external_step(
+                "unconfirmed native test action",
+                expectation,
+                || true,
+                |_| Ok(false),
+                Duration::from_millis(25),
+            )
+            .unwrap_err();
+        assert!(is_timeout(&error));
+    }
+
+    #[test]
+    fn config_changed_is_decoded_and_ignored() {
+        let event: RiftEvent = serde_json::from_str(r#"{"type":"config_changed","revision":42}"#)
+            .expect("Rift 0.7 config_changed event must decode");
+
+        assert!(matches!(event, RiftEvent::ConfigChanged { revision: 42 }));
+        assert!(!is_transition_event(&event));
+        assert_eq!(event_workspace(&event), None);
+        assert!(event.space_id_opt().is_none());
+        assert!(event.display_uuid().is_none());
+        assert!(
+            !EventExpectation::Workspace {
+                display_uuid: "external",
+                workspace_name: "W",
+            }
+            .matches(&event)
+        );
+    }
 
     #[test]
     fn workspace_expectation_requires_exact_display_and_workspace() {

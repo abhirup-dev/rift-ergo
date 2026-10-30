@@ -9,6 +9,9 @@
 rustc-ice-*.txt
 *.profraw
 
+# Local agent session state
+.pi/
+
 # Machine-local files
 .DS_Store
 .env

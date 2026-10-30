@@ -183,6 +183,38 @@ impl Rift {
         })
     }
 
+    /// The window macOS is sending keystrokes to, located in Rift's model.
+    ///
+    /// Unlike `focused_window`, this ignores Rift's `is_focused` flag, which can
+    /// name the wrong window of a multi-window application (see `key_window`).
+    pub fn key_window(&self, displays: &[DisplayData]) -> Result<FocusedWindow> {
+        let window_server_id = crate::key_window::window_server_id()?;
+        for display in displays {
+            let Some(space) = display_space(display) else {
+                continue;
+            };
+            for workspace in self.client.get_workspaces(Some(space))? {
+                if let Some(window) = workspace
+                    .windows
+                    .into_iter()
+                    .find(|window| window.window_server_id == Some(window_server_id))
+                {
+                    return Ok(FocusedWindow {
+                        window,
+                        location: WindowLocation {
+                            display_uuid: display.uuid.clone(),
+                            workspace_name: workspace.name,
+                            is_focused: true,
+                        },
+                    });
+                }
+            }
+        }
+        Err(state_error(format!(
+            "key window {window_server_id} is not managed by Rift"
+        )))
+    }
+
     /// The workspace a keybinding refers to.
     ///
     /// The key window decides, not the display macOS reports as active. Both

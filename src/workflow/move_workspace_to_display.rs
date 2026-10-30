@@ -58,20 +58,10 @@ pub fn move_workspace_to_display(direction: DisplayDirection) -> Result<()> {
     // source through `workspace_command_space`, which is the active display's
     // space filtered by "is this space active", and it requires the same of the
     // destination. A native-fullscreen space on either end is a silent no-op.
-    // Escaping works by activating an application, so it runs before the source
-    // display is bound, never after.
-    let displays = space_escape::ensure_managed_space(
-        &rift,
-        &target_display.uuid,
-        displays,
-        Some(&workspace_name),
-    )?;
-    let displays = space_escape::ensure_managed_space(
-        &rift,
-        &source_display_uuid,
-        displays,
-        Some(&workspace_name),
-    )?;
+    // Native recovery changes focus, so it runs before the source display is
+    // bound, never after.
+    let displays = space_escape::ensure_managed_space(&rift, &target_display.uuid, displays)?;
+    let displays = space_escape::ensure_managed_space(&rift, &source_display_uuid, displays)?;
 
     let target = rift.target_context(&workspace_name, target_display.uuid, &displays)?;
     let source_context =

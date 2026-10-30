@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 crossbeam-channel = "0.5.16"
-rift-client = { git = "https://github.com/acsandmann/rift.git", rev = "72f73ca" }
+rift-client = { git = "https://github.com/acsandmann/rift.git", rev = "2bb6647a18cde9ac44470d296988298c1093460d" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

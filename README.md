@@ -1,19 +1,19 @@
 # rift-ergo
 
 Fast ergonomic workflows for the local Rift setup. `rift-ergo` is pinned to
-Rift v0.6.1 and talks directly to Rift's Mach service through the typed
+Rift v0.7.2 and talks directly to Rift's Mach service through the typed
 `rift-client` API. It does not shell out to `rift-cli`.
 
 Rift 0.5.8.1 was previously tried and rolled back: it migrated windows between
 displays on its own, with no commands issued. That has not reproduced on
-v0.5.10 or later (in daily use since 2026-09-23). v0.6.1's client API differs
-from v0.5.10 only by an additive `DirectionalDistance` trait. The v0.5.10
-binaries are kept as `~/.local/bin/rift.0.5.10` and `rift-cli.0.5.10` for
+v0.5.10 or later (in daily use since 2026-09-23). The v0.5.10 binaries are
+kept as `~/.local/bin/rift.0.5.10` and `rift-cli.0.5.10` for
 rollback.
 
 The helper is intentionally an orchestration layer, not a second window
-manager. Window moves, display transfers, workspace activation, focus, state
-queries, and events all use Rift's native primitives.
+manager. Managed-window moves, display transfers, workspace activation, state
+queries, and events use Rift's native primitives. Native macOS Space recovery
+adds a narrow WindowServer/Dock bridge for fullscreen Spaces Rift omits.
 
 ## Commands
 
@@ -31,6 +31,35 @@ queries, and events all use Rift's native primitives.
 
 Workspace arguments are Rift workspace names, including numeric names such as
 `1` and alphanumeric names such as `A` or `W`.
+
+### Native fullscreen recovery
+
+A native fullscreen app lives on a macOS Space outside Rift's managed Desktop.
+The shared recovery step handles both the active display and an inactive target:
+
+```text
+resolve target display
+  -> focus a window already visible on its native Space
+  -> Dock gesture to its Rift Desktop
+  -> confirm the exact Desktop in WindowServer and Rift
+  -> activate the requested Rift workspace
+```
+
+The gesture core is embedded Rust, adapted from ISS v3.1; neither the ISS app nor
+its CLI is a runtime dependency. Its modern event format targets macOS 27.
+WindowServer supplies the complete Space order, including fullscreen Spaces
+missing from Rift's list. Gesture events carry explicit display coordinates
+without moving the real pointer.
+
+Native focus and gestures run through `RiftTransaction::external_step`, using
+the existing Crossbeam subscription, focus lease, state checks, and deadlines.
+Displays are processed serially, with the originating display last for the
+both-display command. Native state overrides stale Rift active-Space flags.
+
+The former animated app-activation and raw SkyLight Space-swap fallbacks are
+removed. If focus, APIs, or destination confirmation fail, the command reports
+an error instead of silently taking a visually unsafe path. The upstream MIT
+notice is retained in `THIRD_PARTY_NOTICES`.
 
 ### `move-follow`
 

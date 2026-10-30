@@ -1,5 +1,8 @@
+mod dock_swipe;
 mod focus_lease;
+mod key_window;
 mod logging;
+mod native_focus;
 mod notify;
 mod policy;
 mod rift;

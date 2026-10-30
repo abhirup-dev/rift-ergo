@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::rift::Rift;
+use crate::space_escape;
 use crate::transaction::RiftTransaction;
 
 use super::placement;
@@ -18,17 +19,22 @@ pub fn switch_workspace_both(workspace_name: &str) -> Result<()> {
 
     // Where the keyboard was. This binding changes what the other displays
     // show; it is not a request to move there.
-    let origin = displays
-        .iter()
-        .find(|display| display.is_active_context)
-        .map(|display| display.uuid.clone());
+    let origin = space_escape::active_display_uuid(&displays);
 
     // Taken up front: each activation returns fresh data, and iterating that
     // while it is being replaced would borrow it for the whole loop.
-    let uuids = displays
+    let mut uuids = displays
         .iter()
         .map(|display| display.uuid.clone())
         .collect::<Vec<_>>();
+    // Recover the other displays first. Finishing on the origin avoids an
+    // extra focus round trip and reduces fullscreen app-activation churn.
+    if let Some(origin) = &origin
+        && let Some(position) = uuids.iter().position(|uuid| uuid == origin)
+    {
+        let origin = uuids.remove(position);
+        uuids.push(origin);
+    }
 
     for uuid in &uuids {
         displays = activate_on_display(&rift, workspace_name, uuid, displays)?;
@@ -40,9 +46,9 @@ pub fn switch_workspace_both(workspace_name: &str) -> Result<()> {
     };
     // A no-op when the origin was the last display activated.
     let target = rift.target_context(workspace_name, origin, &displays)?;
-    if target.display_is_active {
+    if target.display_is_active && target.workspace_is_active {
         return Ok(());
     }
     let transaction = RiftTransaction::new(&rift)?;
-    placement::acquire_display(&rift, &transaction, &target, workspace_name)
+    placement::prepare_target(&rift, &transaction, &target, workspace_name)
 }

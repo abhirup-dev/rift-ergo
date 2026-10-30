@@ -23,11 +23,7 @@ use super::placement;
 pub fn switch_workspace(workspace_name: &str) -> Result<()> {
     let rift = Rift::connect()?;
     let mut displays = rift.displays()?;
-
-    let origin = displays
-        .iter()
-        .find(|display| display.is_active_context)
-        .map(|display| display.uuid.clone());
+    let origin = space_escape::active_display_uuid(&displays);
 
     let mut targets: Vec<String> = rift
         .workspace_on_each_display(workspace_name, &displays)?
@@ -67,8 +63,7 @@ pub(super) fn activate_on_display(
     display_uuid: &str,
     displays: Vec<DisplayData>,
 ) -> Result<Vec<DisplayData>> {
-    let displays =
-        space_escape::ensure_managed_space(rift, display_uuid, displays, Some(workspace_name))?;
+    let displays = space_escape::ensure_managed_space(rift, display_uuid, displays)?;
     let target = rift.target_context(workspace_name, display_uuid.to_owned(), &displays)?;
 
     // Rift's auto-back-and-forth is disabled in config, but re-issuing a switch

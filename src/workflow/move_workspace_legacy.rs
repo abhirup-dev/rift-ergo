@@ -63,13 +63,8 @@ pub fn move_workspace_to_display(direction: DisplayDirection) -> Result<()> {
     // A display showing a native-fullscreen space has no space Rift manages, so
     // `target_context` below -- and every display-targeted command after it --
     // would fail outright. Recover it first. `source` is captured above because
-    // escaping works by activating an application, which moves focus.
-    let displays = space_escape::ensure_managed_space(
-        &rift,
-        &target_display.uuid,
-        displays,
-        Some(&workspace_name),
-    )?;
+    // native recovery can acquire another display and change focus.
+    let displays = space_escape::ensure_managed_space(&rift, &target_display.uuid, displays)?;
     let target = rift.target_context(&workspace_name, target_display.uuid, &displays)?;
 
     let transaction = RiftTransaction::for_batch(&rift, source.workspace.windows.len())?;
