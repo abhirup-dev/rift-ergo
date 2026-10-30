@@ -14,7 +14,19 @@ const BATCH_ITEM_BUDGET: Duration = Duration::from_secs(2);
 const BATCH_SETUP_TIMEOUT: Duration = Duration::from_millis(2_500);
 const MIN_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 const STATE_PROBE_INTERVAL: Duration = Duration::from_millis(20);
+/// How long a confirmed step insists on a matching event before it will accept
+/// a direct state probe.
+///
+/// The event requirement exists to avoid reading pre-command state and calling
+/// it success. It also means a command that is already satisfied -- a
+/// reassertion of placement Rift has done -- emits nothing and so blocks for
+/// the whole timeout before the post-deadline check notices. Past this grace
+/// period a probe is allowed, which keeps the staleness guarantee for the
+/// window where it matters while letting a no-op settle in ~250 ms rather than
+/// the full budget.
+const EVENT_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const STABLE_STATE_DURATION: Duration = Duration::from_millis(350);
+const SLOW_STEP_THRESHOLD: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Copy)]
 pub enum EventExpectation<'a> {
@@ -44,7 +56,7 @@ impl EventExpectation<'_> {
 }
 
 enum EventMessage {
-    Event(RiftEvent),
+    Event(Box<RiftEvent>),
     Error(String),
 }
 
@@ -141,6 +153,27 @@ impl<'a> RiftTransaction<'a> {
         Commands: IntoIterator<Item = RiftCommand>,
         StateCheck: FnMut(&Rift) -> Result<bool>,
     {
+        self.confirmed_phase_with_timeout(
+            description,
+            commands,
+            expectation,
+            state_matches,
+            self.step_timeout,
+        )
+    }
+
+    pub fn confirmed_phase_with_timeout<Commands, StateCheck>(
+        &self,
+        description: &str,
+        commands: Commands,
+        expectation: EventExpectation<'_>,
+        state_matches: StateCheck,
+        timeout: Duration,
+    ) -> Result<()>
+    where
+        Commands: IntoIterator<Item = RiftCommand>,
+        StateCheck: FnMut(&Rift) -> Result<bool>,
+    {
         self.ensure_budget(description)?;
         self.drain_pending_events()?;
         let started = Instant::now();
@@ -152,8 +185,64 @@ impl<'a> RiftTransaction<'a> {
             expectation,
             state_matches,
             started,
-            self.step_timeout,
+            timeout,
             true,
+        )
+    }
+
+    /// A native action outside Rift's IPC, confirmed by the same Crossbeam
+    /// subscription and state/deadline loop as an ordinary transaction step.
+    /// Renew the focus lease and drain old events before acting. `false` means
+    /// the action was unavailable; a posted action still has to be confirmed.
+    pub fn external_step<Action, StateCheck>(
+        &self,
+        description: &str,
+        expectation: EventExpectation<'_>,
+        action: Action,
+        state_matches: StateCheck,
+        timeout: Duration,
+    ) -> Result<bool>
+    where
+        Action: FnOnce() -> bool,
+        StateCheck: FnMut(&Rift) -> Result<bool>,
+    {
+        self.ensure_budget(description)?;
+        self.drain_pending_events()?;
+        let started = Instant::now();
+        if !action() {
+            return Ok(false);
+        }
+        self.wait_for_state(
+            description,
+            expectation,
+            state_matches,
+            started,
+            timeout,
+            false,
+        )?;
+        Ok(true)
+    }
+
+    /// Wait for state already set in motion outside this transaction -- an
+    /// application activation, a space switch -- without issuing a command.
+    pub fn await_state<StateCheck>(
+        &self,
+        description: &str,
+        expectation: EventExpectation<'_>,
+        state_matches: StateCheck,
+        timeout: Duration,
+    ) -> Result<()>
+    where
+        StateCheck: FnMut(&Rift) -> Result<bool>,
+    {
+        self.ensure_budget(description)?;
+        self.wait_for_state(
+            description,
+            expectation,
+            state_matches,
+            Instant::now(),
+            timeout,
+            false,
         )
     }
 
@@ -200,6 +289,10 @@ impl<'a> RiftTransaction<'a> {
             }
         }
 
+        crate::logging::warn(&format!(
+            "timeout waiting for stable {description} after {} ms",
+            started.elapsed().as_millis()
+        ));
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("timed out waiting for stable {description}"),
@@ -221,6 +314,7 @@ impl<'a> RiftTransaction<'a> {
     {
         let deadline = self.deadline(started, timeout);
         let mut matching_event_seen = false;
+        let mut last_probe = started;
 
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -228,18 +322,25 @@ impl<'a> RiftTransaction<'a> {
             match self.events.recv_timeout(wait) {
                 Ok(EventMessage::Event(event)) if expectation.matches(&event) => {
                     matching_event_seen = true;
+                    last_probe = Instant::now();
                     if state_matches(self.rift)? {
                         trace_wait(description, "matching event", started.elapsed());
                         return Ok(());
                     }
                 }
-                Ok(EventMessage::Event(_)) => {}
+                Ok(EventMessage::Event(_)) if last_probe.elapsed() < STATE_PROBE_INTERVAL => {}
                 Ok(EventMessage::Error(error)) => {
                     return Err(state_error(format!("event subscription failed: {error}")));
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    if (!require_matching_event || matching_event_seen) && state_matches(self.rift)?
-                    {
+                // Unrelated events still probe once the interval is up: an
+                // activation floods the stream, which otherwise starves the
+                // probe until the deadline.
+                Ok(EventMessage::Event(_)) | Err(RecvTimeoutError::Timeout) => {
+                    last_probe = Instant::now();
+                    let event_requirement_satisfied = !require_matching_event
+                        || matching_event_seen
+                        || started.elapsed() >= EVENT_GRACE_PERIOD;
+                    if event_requirement_satisfied && state_matches(self.rift)? {
                         trace_wait(description, "state probe", started.elapsed());
                         return Ok(());
                     }
@@ -255,6 +356,10 @@ impl<'a> RiftTransaction<'a> {
             return Ok(());
         }
 
+        crate::logging::warn(&format!(
+            "timeout waiting for {description} after {} ms",
+            started.elapsed().as_millis()
+        ));
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("timed out waiting for {description}"),
@@ -292,6 +397,9 @@ impl<'a> RiftTransaction<'a> {
     }
 
     fn ensure_budget(&self, description: &str) -> Result<()> {
+        // Every step goes through here, so this is where a running workflow
+        // keeps telling the focus-follow hook to stay out of its way.
+        crate::focus_lease::renew();
         if self
             .batch_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -306,6 +414,14 @@ impl<'a> RiftTransaction<'a> {
     }
 }
 
+/// Whether a step failed only by running out of time, which callers with a
+/// fallback or a later reconciliation pass treat as recoverable.
+pub fn is_timeout(error: &crate::DynError) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+}
+
 fn start_event_reader(subscription: rift_client::RiftMachSubscription) -> Receiver<EventMessage> {
     let (tx, rx) = bounded(64);
     thread::spawn(move || {
@@ -315,7 +431,7 @@ fn start_event_reader(subscription: rift_client::RiftMachSubscription) -> Receiv
                     if !is_transition_event(&event) {
                         continue;
                     }
-                    if tx.send(EventMessage::Event(event)).is_err() {
+                    if tx.send(EventMessage::Event(Box::new(event))).is_err() {
                         return;
                     }
                 }
@@ -335,6 +451,7 @@ fn is_transition_event(event: &RiftEvent) -> bool {
         RiftEvent::WorkspaceChanged { .. }
             | RiftEvent::WindowsChanged { .. }
             | RiftEvent::FocusedWindowChanged { .. }
+            | RiftEvent::LayoutChanged { .. }
     )
 }
 
@@ -342,8 +459,18 @@ fn event_workspace(event: &RiftEvent) -> Option<&str> {
     match event {
         RiftEvent::WorkspaceChanged { workspace_name, .. }
         | RiftEvent::WindowsChanged { workspace_name, .. }
-        | RiftEvent::FocusedWindowChanged { workspace_name, .. } => Some(workspace_name),
-        RiftEvent::WindowTitleChanged { .. } | RiftEvent::StacksChanged { .. } => None,
+        | RiftEvent::FocusedWindowChanged { workspace_name, .. }
+        | RiftEvent::LayoutChanged { workspace_name, .. } => Some(workspace_name),
+        // Not transitions: a title, a stack redraw, and a selection move within
+        // a layout, a binding mode switch, and a config revision all leave
+        // workspace membership and display placement alone,
+        // so waiting on them would wake a step before its state changed. The
+        // match stays exhaustive so a new Rift event forces this decision.
+        RiftEvent::WindowTitleChanged { .. }
+        | RiftEvent::StacksChanged { .. }
+        | RiftEvent::SelectionChanged { .. }
+        | RiftEvent::BindingModeChanged { .. }
+        | RiftEvent::ConfigChanged { .. } => None,
     }
 }
 
@@ -354,12 +481,84 @@ fn trace_wait(description: &str, completion: &str, elapsed: Duration) {
             elapsed.as_millis()
         );
     }
+    // A step that takes this long still succeeded, but it is the earliest
+    // signal that Rift's confirmation path has regressed.
+    if elapsed >= SLOW_STEP_THRESHOLD {
+        crate::logging::warn(&format!(
+            "slow {description} completed by {completion} in {} ms",
+            elapsed.as_millis()
+        ));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rift_client::{WindowId, WorkspaceId};
+
+    #[test]
+    #[ignore = "read-only Crossbeam/native-step integration check; requires running Rift"]
+    fn external_step_requires_state_confirmation() {
+        let rift = Rift::connect().unwrap();
+        let transaction = RiftTransaction::new(&rift).unwrap();
+        let expectation = EventExpectation::Display("no-matching-event-required");
+        assert!(
+            !transaction
+                .external_step(
+                    "unavailable native test action",
+                    expectation,
+                    || false,
+                    |_| panic!("an unavailable action must not wait"),
+                    Duration::from_millis(100),
+                )
+                .unwrap()
+        );
+        let mut probed = false;
+        assert!(
+            transaction
+                .external_step(
+                    "confirmed native test action",
+                    expectation,
+                    || true,
+                    |_| {
+                        probed = true;
+                        Ok(true)
+                    },
+                    Duration::from_millis(100),
+                )
+                .unwrap()
+        );
+        assert!(probed);
+        let error = transaction
+            .external_step(
+                "unconfirmed native test action",
+                expectation,
+                || true,
+                |_| Ok(false),
+                Duration::from_millis(25),
+            )
+            .unwrap_err();
+        assert!(is_timeout(&error));
+    }
+
+    #[test]
+    fn config_changed_is_decoded_and_ignored() {
+        let event: RiftEvent = serde_json::from_str(r#"{"type":"config_changed","revision":42}"#)
+            .expect("Rift 0.7 config_changed event must decode");
+
+        assert!(matches!(event, RiftEvent::ConfigChanged { revision: 42 }));
+        assert!(!is_transition_event(&event));
+        assert_eq!(event_workspace(&event), None);
+        assert!(event.space_id_opt().is_none());
+        assert!(event.display_uuid().is_none());
+        assert!(
+            !EventExpectation::Workspace {
+                display_uuid: "external",
+                workspace_name: "W",
+            }
+            .matches(&event)
+        );
+    }
 
     #[test]
     fn workspace_expectation_requires_exact_display_and_workspace() {

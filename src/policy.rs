@@ -20,6 +20,9 @@ struct Policy {
 struct DisplayAlias {
     uuid: Option<String>,
     name: Option<String>,
+    /// Interchangeable monitors that fill the same role, e.g. one per desk.
+    #[serde(default)]
+    names: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +168,10 @@ fn resolve_display_aliases(policy: &Policy, displays: &[DisplayData]) -> HashMap
                 .find(|display| {
                     configured.uuid.as_deref() == Some(display.uuid.as_str())
                         || configured.name.as_deref() == display.name.as_deref()
+                        || configured
+                            .names
+                            .iter()
+                            .any(|name| display.name.as_deref() == Some(name.as_str()))
                 })
                 .map(|display| (alias.clone(), display.uuid.clone()))
         })
@@ -280,7 +287,9 @@ mod tests {
                     height: 100.0,
                 },
             },
+            backing_scale: 1.0,
             space: Some(1),
+            is_visible_space: true,
             is_active_space: true,
             is_active_context: true,
             active_space_ids: vec![1],
@@ -314,7 +323,26 @@ mod tests {
             bundle_id: Some("com.example.app".into()),
             app_name: Some("Example".into()),
             window_server_id: Some(7),
+            layout_position: None,
         }
+    }
+
+    #[test]
+    fn alias_matches_any_listed_display_name() {
+        let policy = Policy {
+            display_aliases: HashMap::from([(
+                "external".into(),
+                DisplayAlias {
+                    uuid: None,
+                    name: None,
+                    names: vec!["LS27D80xU".into(), "D27-40".into()],
+                },
+            )]),
+            profiles: Vec::new(),
+        };
+        let aliases = resolve_display_aliases(&policy, &[display("d27", "D27-40")]);
+        assert_eq!(aliases.get("external").map(String::as_str), Some("d27"));
+        assert!(resolve_display_aliases(&policy, &[display("x", "Other")]).is_empty());
     }
 
     #[test]
@@ -326,6 +354,7 @@ mod tests {
                     DisplayAlias {
                         uuid: Some("built".into()),
                         name: None,
+                        names: Vec::new(),
                     },
                 ),
                 (
@@ -333,6 +362,7 @@ mod tests {
                     DisplayAlias {
                         uuid: Some("ext".into()),
                         name: None,
+                        names: Vec::new(),
                     },
                 ),
             ]),

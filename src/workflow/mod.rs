@@ -1,21 +1,30 @@
+mod focus_follow;
 mod move_follow;
 mod move_window_to_display;
+mod move_workspace_legacy;
 mod move_workspace_to_display;
+mod new_window;
 mod placement;
+mod prune_layout;
 mod rehome;
 mod switch_workspace;
 mod switch_workspace_both;
+mod switch_workspace_focused;
 
 use rift_client::DisplayData;
 
 use crate::{Result, state_error, usage_error};
 
+pub use focus_follow::on_focus_change;
 pub use move_follow::move_follow;
 pub use move_window_to_display::move_window_to_display;
 pub use move_workspace_to_display::move_workspace_to_display;
+pub use new_window::{init_seen, on_windows_changed};
+pub use prune_layout::prune_layout;
 pub use rehome::rehome;
 pub use switch_workspace::switch_workspace;
 pub use switch_workspace_both::switch_workspace_both;
+pub use switch_workspace_focused::switch_workspace_focused;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisplayDirection {
@@ -71,7 +80,9 @@ mod tests {
                     height: 100.0,
                 },
             },
+            backing_scale: 1.0,
             space: Some(1),
+            is_visible_space: true,
             is_active_space: true,
             is_active_context: false,
             active_space_ids: vec![1],
